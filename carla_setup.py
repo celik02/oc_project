@@ -2,6 +2,7 @@ import carla
 from agents.navigation.global_route_planner import GlobalRoutePlanner  # type: ignore
 from agents.navigation.constant_velocity_agent import ConstantVelocityAgent  # just constant velocity no lateral control
 from agents.navigation.basic_agent import BasicAgent
+from agents.navigation.controller import VehiclePIDController
 import time
 
 
@@ -169,6 +170,32 @@ def generate_overtake_waypoints(carla_manager, vehicle, direction="left",
     return waypoints
 
 
+def get_next_waypoint_from_list(waypoints, vehicle, current_index, threshold=2.0):
+    """
+    Return the next waypoint from 'waypoints' based on the vehicle's current position.
+
+    Args:
+        waypoints: List of generated overtaking waypoints.
+        vehicle: The vehicle actor.
+        current_index: The current index in the waypoint list.
+        threshold (float): Distance threshold to consider the waypoint reached.
+
+    Returns:
+        (next_wp, updated_index)
+    """
+    vehicle_loc = vehicle.get_location()
+
+    # If the vehicle is close enough to the current target,
+    # advance to the next waypoint if available.
+    if current_index < len(waypoints):
+        wp = waypoints[current_index]
+        if vehicle_loc.distance(wp.transform.location) < threshold and current_index < len(waypoints)-1:
+            current_index += 1
+    else:
+        current_index = len(waypoints) - 1  # stay on the last one
+    return waypoints[current_index], current_index
+
+
 if __name__ == "__main__":
     carla_manager = CarlaManager()
     print("CarlaManager is created")
@@ -177,7 +204,7 @@ if __name__ == "__main__":
     time.sleep(1)  # allow the vehicle to spawn
 
     # start autopilot controller for preciding vehicle
-    agent = BasicAgent(preceding_vehicle)
+    agent = BasicAgent(preceding_vehicle, target_speed=10)
 
     # set destination for the preceding vehicle
     current_location = preceding_vehicle.get_location()
@@ -199,15 +226,22 @@ if __name__ == "__main__":
     waypoints = generate_overtake_waypoints(carla_manager, ego_vehicle,
                                             direction="left",
                                             distance_current_lane=10.0,
-                                            lane_change_step=2.0,
-                                            overtake_distance=50.0,
+                                            lane_change_step=1.0,
+                                            overtake_distance=100.0,
                                             merge_distance=10.0)
     # For debugging, you can visualize the waypoints:
     carla_manager.debug_waypoints(waypoints)
+    pid_controller = VehiclePIDController(ego_vehicle, {'K_P': 0.5}, {'K_P': 0.05, 'K_I': 0.05, 'K_D': 0.1})
 
+    current_wp_index = 0
     # main loop
     while True:
         control_cmd = agent.run_step()
         preceding_vehicle.apply_control(control_cmd)
+
+        # PID controller for ego vehicle -- not working yet
+        next_overtake_wp, current_wp_index = get_next_waypoint_from_list(waypoints, ego_vehicle, current_wp_index, threshold=2.0)
+        ego_control = pid_controller.run_step(20, next_overtake_wp)  # target speed 30 km/h
+        ego_vehicle.apply_control(ego_control)
         # print('Specator location:', carla_manager.spectator.get_transform().location, 'rotation:', carla_manager.spectator.get_transform().rotation)
         time.sleep(0.05)
