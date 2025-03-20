@@ -11,6 +11,8 @@ SPAWN_LOCATION = [
     13.511219,
     14.171306,
 ]  # for spectator camera
+
+# synchronous_mode will make the simulation predictable
 synchronous_mode = False
 
 
@@ -54,6 +56,9 @@ class CarlaManager:
         self.client.apply_batch([carla.command.DestroyActor(x) for x in self.world.get_actors()])
 
     def spawn_vehicle(self, blueprint_name, spawn_point):
+        '''
+        spawn a vehicle at the given spawn_point
+        '''
         spawn_transform = self.map.get_waypoint(
             carla.Location(x=spawn_point[0], y=spawn_point[1], z=10),
             project_to_road=True).transform
@@ -70,13 +75,98 @@ class CarlaManager:
         for w in waypoints:
             if i % 10 == 0:
                 self.world.debug.draw_string(
-                    w[0].transform.location,
+                    w.transform.location,
                     "O",
                     draw_shadow=False,
                     color=carla.Color(r=255, g=0, b=0),
                     life_time=120.0,
                     persistent_lines=True,
                 )
+
+
+def generate_overtake_waypoints(carla_manager, vehicle, direction="left",
+                                distance_current_lane=10.0,
+                                lane_change_step=2.0,
+                                overtake_distance=50.0,
+                                merge_distance=10.0):
+    """
+    Generate a list of waypoints for an overtaking maneuver.
+
+    Args:
+        carla_manager: Instance of CarlaManager containing the map.
+        vehicle: The vehicle actor (rear vehicle).
+        direction (str): "left" or "right" lane change direction.
+        distance_current_lane (float): Distance to follow in current lane before lane change.
+        lane_change_step (float): Interval (in meters) to sample waypoints.
+        overtake_distance (float): Distance to follow in the adjacent lane.
+        merge_distance (float): Distance to follow in merging lane after overtaking.
+
+    Returns:
+        List of carla.Waypoint objects forming the overtaking trajectory.
+    """
+    _map = carla_manager.map
+    waypoints = []
+
+    # 1. Start in current lane.
+    current_wp = _map.get_waypoint(vehicle.get_location(), project_to_road=True)
+    waypoints.append(current_wp)
+
+    # Follow current lane for distance_current_lane
+    traveled = 0.0
+    last_wp = current_wp
+    while traveled < distance_current_lane:
+        next_wps = last_wp.next(lane_change_step)
+        if not next_wps:
+            break
+        next_wp = next_wps[0]
+        traveled += next_wp.transform.location.distance(last_wp.transform.location)
+        waypoints.append(next_wp)
+        last_wp = next_wp
+
+    # 2. Change lane: get the adjacent lane from the last waypoint
+    if direction == "left":
+        adjacent_wp = last_wp.get_left_lane()
+    else:
+        adjacent_wp = last_wp.get_right_lane()
+
+    if adjacent_wp is None:
+        print("No adjacent lane available in direction", direction)
+        return waypoints
+
+    waypoints.append(adjacent_wp)
+    last_wp = adjacent_wp
+
+    # 3. Follow adjacent lane for overtaking distance.
+    traveled = 0.0
+    while traveled < overtake_distance:
+        next_wps = last_wp.next(lane_change_step)
+        if not next_wps:
+            break
+        next_wp = next_wps[0]
+        traveled += next_wp.transform.location.distance(last_wp.transform.location)
+        waypoints.append(next_wp)
+        last_wp = next_wp
+
+    # 4. Merge back to the original lane.
+    if direction == "left":
+        merging_wp = last_wp.get_right_lane()
+    else:
+        merging_wp = last_wp.get_left_lane()
+
+    if merging_wp is not None:
+        waypoints.append(merging_wp)
+        last_wp = merging_wp
+        traveled = 0.0
+        while traveled < merge_distance:
+            next_wps = last_wp.next(lane_change_step)
+            if not next_wps:
+                break
+            next_wp = next_wps[0]
+            traveled += next_wp.transform.location.distance(last_wp.transform.location)
+            waypoints.append(next_wp)
+            last_wp = next_wp
+
+    return waypoints
 
 
 if __name__ == "__main__":
@@ -92,8 +182,9 @@ if __name__ == "__main__":
     # set destination for the preceding vehicle
     current_location = preceding_vehicle.get_location()
     current_wp = carla_manager.map.get_waypoint(current_location, project_to_road=True)
-    next_wps = current_wp.next(50.0)  # 50 meters ahead
-    if next_wps:
+    next_wps = current_wp.next(100.0)  # 100 meters ahead
+
+    if next_wps:  # if there is a waypoint ahead
         destination = next_wps[0].transform.location
     else:
         destination = current_location
@@ -102,8 +193,21 @@ if __name__ == "__main__":
     # spawn ego vehicle
     SPAWN_LOCATION[0] += 10
     ego_vehicle = carla_manager.spawn_vehicle("vehicle.tesla.model3", SPAWN_LOCATION)
+    time.sleep(1)  # allow the vehicle to spawn
+
+    # generate overtaking waypoints
+    waypoints = generate_overtake_waypoints(carla_manager, ego_vehicle,
+                                            direction="left",
+                                            distance_current_lane=10.0,
+                                            lane_change_step=2.0,
+                                            overtake_distance=50.0,
+                                            merge_distance=10.0)
+    # For debugging, you can visualize the waypoints:
+    carla_manager.debug_waypoints(waypoints)
+
+    # main loop
     while True:
         control_cmd = agent.run_step()
         preceding_vehicle.apply_control(control_cmd)
-        print('Specator location:', carla_manager.spectator.get_transform().location, 'rotation:', carla_manager.spectator.get_transform().rotation)
+        # print('Specator location:', carla_manager.spectator.get_transform().location, 'rotation:', carla_manager.spectator.get_transform().rotation)
         time.sleep(0.05)
