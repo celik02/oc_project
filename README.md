@@ -24,7 +24,7 @@ conda activate carla-env
 # Install required packages
 conda install -c conda-forge numpy shapely matplotlib
 conda install -c anaconda networkx
-pip install pygame
+pip install pygame scipy casadi
 
 # Additional packages that might be needed
 pip install opencv-python
