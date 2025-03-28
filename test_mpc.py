@@ -12,7 +12,10 @@ import matplotlib.pyplot as plt
 from scipy.optimize import minimize
 import casadi as ca  # For optimization (you'll need to install this)
 
-
+# CARLA coordinate system:
+# x: forward
+# y: right side
+# z: upward
 
 dt = 0.1  # seconds
 SPAWN_LOCATION = [
@@ -57,32 +60,82 @@ def vehicle_dynamics(x, u, dt):
 
 class MPCController:
     def __init__(self, horizon=10, dt=0.1):
-        """
-        Simple MPC controller for vehicle overtaking
-
-        Args:
-            horizon: Prediction horizon length
-            dt: Time step for discretization
-        """
         self.horizon = horizon
         self.dt = dt
-
+        
         # Control constraints
-        self.max_accel = 3.0  # m/s^2
-        self.min_accel = -5.0  # m/s^2
-        self.max_steer = 0.5  # rad
-        self.min_steer = -0.5  # rad
-
-        # Cost function weights
-        self.w_lat = 1.0  # Lateral position tracking
-        self.w_vel = 0.5  # Velocity tracking
-        self.w_accel = 0.1  # Minimize acceleration
-        self.w_steer = 0.1  # Minimize steering
-        self.w_jerk = 0.05  # Minimize jerk
-
+        self.max_accel = 3.0
+        self.min_accel = -5.0
+        self.max_steer = 0.5 / 2
+        self.min_steer = -0.5 / 2
+        
         # Safety parameters
-        self.safe_distance = 6.0  # Minimum safe distance to lead vehicle
+        self.safe_distance = 10.0
+        
+        # Cost function weights
+        self.w_progress = 0.1    # Forward progress reward
+        self.w_safety = 100.0    # Safety constraint (high priority)
+        self.w_lane = 0.5        # Lane centering reward
+        self.w_speed = 0.8       # Target speed reward
+        self.w_accel = 0.1       # Acceleration minimization
+        self.w_steer = 0.1       # Steering minimization
+        self.w_jerk = 0.05       # Jerk minimization
 
+    def run_step(self, ego_vehicle, preceding_vehicle, target_speed):
+        # Extract current state
+        ego_transform = ego_vehicle.get_transform()
+        ego_velocity = ego_vehicle.get_velocity()
+        lead_transform = preceding_vehicle.get_transform()
+        lead_velocity = preceding_vehicle.get_velocity()
+        
+        # Construct current state vector
+        x0 = np.array([
+            ego_transform.location.x,
+            ego_transform.location.y,
+            ego_transform.rotation.yaw * np.pi / 180.0,
+            np.sqrt(ego_velocity.x**2 + ego_velocity.y**2),
+            0.0  # Estimated acceleration
+        ])
+        
+        # Get lead vehicle state and speed
+        lead_state = (lead_transform.location.x, lead_transform.location.y)
+        lead_speed = np.sqrt(lead_velocity.x**2 + lead_velocity.y**2)
+        
+        # Generate lead vehicle prediction
+        lead_vehicle_pred = self.get_lead_vehicle_prediction(lead_state, lead_speed)
+        
+        # Solve optimization problem
+        u_optimal = self.optimize_trajectory(x0, lead_vehicle_pred, target_speed)
+        
+        # Convert to CARLA control
+        control = self.convert_to_control(u_optimal[0])
+        
+        return control
+        
+    def optimize_trajectory(self, x0, lead_vehicle_pred, target_speed):
+        # Initial guess - zeros for all controls
+        u0 = np.zeros(self.horizon * 2)
+        
+        # Define bounds for controls
+        bounds = []
+        for i in range(self.horizon):
+            bounds.append((self.min_accel, self.max_accel))
+            bounds.append((self.min_steer, self.max_steer))
+        
+        # Solve optimization problem
+        result = minimize(
+            self.objective_function,
+            u0,
+            args=(x0, lead_vehicle_pred),
+            method="SLSQP",
+            bounds=bounds,
+            options={"maxiter": 100}
+        )
+        
+        # Extract optimal control sequence
+        u_optimal = result.x.reshape(self.horizon, 2)
+        
+        return u_optimal
     def get_lead_vehicle_prediction(self, lead_vehicle_state, lead_vehicle_speed):
         """
         Predict lead vehicle trajectory (constant velocity model)
@@ -96,209 +149,113 @@ class MPCController:
 
         return predictions
 
-    def objective_function(self, u, x0, ref_traj, lead_vehicle_pred):
+    def objective_function(self, u, x0, lead_vehicle_pred):
         """
-        MPC cost function
-
-        Args:
-            u: Flattened control sequence [u0, u1, ..., u_{N-1}]
-            x0: Initial state
-            ref_traj: Reference trajectory for lateral position and velocity
-            lead_vehicle_pred: Predicted lead vehicle positions
+        Objective function without explicit reference trajectory
+        
+        Instead of tracking reference points, we optimize for:
+        1. Forward progress (longitudinal advancement)
+        2. Safe distance from lead vehicle
+        3. Lane centering (but allowing for lane changes)
+        4. Target velocity when safe
+        5. Control effort minimization
         """
         # Reshape control sequence
         u = u.reshape(self.horizon, 2)
-
+        
         # Initialize cost and current state
         cost = 0
         x = x0.copy()
-
+        
+        # Lane parameters
+        lane_centers = [0.0, 3.5]  # Center of original lane and adjacent lane
+        
+        # Target speed (higher than lead vehicle)
+        target_speed = 20.0  # m/s
+        
         # Simulate trajectory and compute cost
         for i in range(self.horizon):
-            # Extract reference values
-            y_ref, v_ref = ref_traj[i]
-
-            # Compute control inputs at step i
-            accel = u[i, 0]
-            steer = u[i, 1]
-
-            # Compute cost components
-            # 1. Reference tracking
-            cost += self.w_lat * (x[1] - y_ref) ** 2  # Lateral position error
-            cost += self.w_vel * (x[3] - v_ref) ** 2  # Velocity error
-
-            # 2. Control effort
-            cost += self.w_accel * accel**2
-            cost += self.w_steer * steer**2
-
-            # 3. Jerk (change in acceleration)
-            if i > 0:
-                prev_accel = u[i - 1, 0]
-                cost += self.w_jerk * ((accel - prev_accel) / self.dt) ** 2
-
-            # 4. Safety - soft constraint on distance to lead vehicle
+            # Get lead vehicle position at this step
             lead_x, lead_y = lead_vehicle_pred[i]
-            distance = np.sqrt((x[0] - lead_x) ** 2 + (x[1] - lead_y) ** 2)
-
-            # Heavily penalize being too close to lead vehicle
+            
+            # Compute longitudinal distance to lead vehicle in ego frame
+            # This requires transforming from world to ego-vehicle coordinates
+            relative_x = lead_x - x[0]
+            relative_y = lead_y - x[1]
+            ego_heading = x[2]
+            
+            # Project onto ego vehicle's longitudinal axis
+            rel_long = relative_x * np.cos(ego_heading) + relative_y * np.sin(ego_heading)
+            rel_lat = -relative_x * np.sin(ego_heading) + relative_y * np.cos(ego_heading)
+            
+            # 1. Progress reward - encourage moving forward
+            # We negate this term because we want to maximize progress
+            cost -= self.w_progress * x[0]  
+            
+            # 2. Safe distance - penalize being too close to lead vehicle
+            distance = np.sqrt((x[0] - lead_x)**2 + (x[1] - lead_y)**2)
             if distance < self.safe_distance:
-                cost += 100 * (self.safe_distance - distance) ** 2
+                cost += self.w_safety * (self.safe_distance - distance)**2
 
+            # 3. Lane centering - reward being in either lane center
+            # Transform lane centers from road frame to vehicle-relative frame
+            vehicle_relative_centers = []
+            for center in lane_centers:
+                # Calculate offset perpendicular to vehicle heading
+                # This correctly defines lanes relative to the road direction
+                rel_y = center * np.cos(ego_heading)
+                vehicle_relative_centers.append(rel_y)
+            
+            # Calculate lateral error in vehicle frame
+            lateral_error = min([abs(rel_lat - center) for center in vehicle_relative_centers])
+            cost += self.w_lane * lateral_error**2
+            
+            # 4. Target speed - encourage maintaining desired speed when safe
+            # Only penalize going slower than target if we're not close to lead vehicle
+            if rel_long > self.safe_distance:
+                cost += self.w_speed * max(0, target_speed - x[3])**2
+            
+            # 5. Control effort
+            cost += self.w_accel * u[i, 0]**2  # Acceleration
+            cost += self.w_steer * u[i, 1]**2  # Steering
+            
+            # 6. Jerk minimization for comfort
+            if i > 0:
+                prev_accel = u[i-1, 0]
+                cost += self.w_jerk * ((u[i, 0] - prev_accel) / self.dt)**2
+                
             # Update state for next step
             x = vehicle_dynamics(x, u[i], self.dt)
-
+        
         return cost
-
-    def optimize_trajectory(self, x0, ref_traj, lead_vehicle_state, lead_vehicle_speed):
+    
+    def convert_to_control(self, u_optimal):
         """
-        Solve the MPC optimization problem
-
+        Convert MPC control output to CARLA vehicle control
+        
+        Args:
+            u_optimal: Optimal control input [acceleration, steering]
+        
         Returns:
-            optimal_control: First control input from optimal sequence
+            carla.VehicleControl object
         """
-        # Generate lead vehicle prediction
-        lead_vehicle_pred = self.get_lead_vehicle_prediction(
-            lead_vehicle_state, lead_vehicle_speed
-        )
-
-        # Initial guess - zeros for all controls
-        u0 = np.zeros(self.horizon * 2)
-
-        # Define bounds for controls
-        bounds = []
-        for i in range(self.horizon):
-            bounds.append((self.min_accel, self.max_accel))  # Acceleration bounds
-            bounds.append((self.min_steer, self.max_steer))  # Steering bounds
-
-        # Solve optimization problem
-        result = minimize(
-            self.objective_function,
-            u0,
-            args=(x0, ref_traj, lead_vehicle_pred),
-            method="SLSQP",
-            bounds=bounds,
-            options={"maxiter": 100},
-        )
-
-        # Extract optimal control sequence
-        u_optimal = result.x.reshape(self.horizon, 2)
-
-        # Return first control input
-        return u_optimal[0]
-
-    def generate_reference_trajectory(
-        self, ego_vehicle, preceding_vehicle, target_speed, lane_width=3.5
-    ):
-        """
-        Generate reference trajectory for overtaking
-
-        Strategy:
-        1. Start in current lane
-        2. Move to adjacent lane when close to lead vehicle
-        3. Accelerate to pass lead vehicle
-        4. Return to original lane when sufficiently ahead
-        """
-        # Get current states
-        ego_location = ego_vehicle.get_location()
-        ego_transform = ego_vehicle.get_transform()
-        lead_location = preceding_vehicle.get_location()
-
-        # Extract positions
-        ego_x, ego_y = ego_location.x, ego_location.y
-        lead_x, lead_y = lead_location.x, lead_location.y
-
-        # Compute longitudinal distance to lead vehicle
-        heading = ego_transform.rotation.yaw * np.pi / 180.0
-        dx = lead_x - ego_x
-        dy = lead_y - ego_y
-
-        # Convert to ego vehicle frame
-        long_dist = dx * np.cos(heading) + dy * np.sin(heading)
-        lat_dist = -dx * np.sin(heading) + dy * np.cos(heading)
-
-        # Generate reference trajectory
-        ref_traj = []
-
-        for i in range(self.horizon):
-            future_time = i * self.dt
-
-            # Longitudinal position increases with time based on target speed
-            future_long_pos = target_speed * future_time
-
-            # Lateral position depends on overtaking phase
-            if long_dist < 0:
-                # Already passed the lead vehicle, merge back
-                y_ref = 0  # Target is center of original lane
-                v_ref = target_speed
-            elif long_dist < 20:
-                # Close to lead vehicle, move to adjacent lane
-                y_ref = lane_width  # Target is center of adjacent lane
-                v_ref = target_speed * 1.3  # Accelerate to pass
-            else:
-                # Far from lead vehicle, stay in lane
-                y_ref = 0  # Target is center of original lane
-                v_ref = target_speed
-
-            ref_traj.append((y_ref, v_ref))
-
-        return ref_traj
-
-    def run_step(self, ego_vehicle, preceding_vehicle, target_speed):
-        """
-        Execute one step of MPC
-        """
-        # Get current state
-        ego_transform = ego_vehicle.get_transform()
-        ego_velocity = ego_vehicle.get_velocity()
-        lead_transform = preceding_vehicle.get_transform()
-        lead_velocity = preceding_vehicle.get_velocity()
-
-        # Extract state components
-        x = ego_transform.location.x
-        y = ego_transform.location.y
-        psi = ego_transform.rotation.yaw * np.pi / 180.0
-        v = np.sqrt(ego_velocity.x**2 + ego_velocity.y**2)
-
-        # Estimate current acceleration (simplified)
-        a = 0.0  # Could be improved with proper state estimation
-
-        # Construct current state vector
-        x0 = np.array([x, y, psi, v, a])
-
-        # Get lead vehicle state and speed
-        lead_x = lead_transform.location.x
-        lead_y = lead_transform.location.y
-        lead_speed = np.sqrt(lead_velocity.x**2 + lead_velocity.y**2)
-
-        # Generate reference trajectory
-        ref_traj = self.generate_reference_trajectory(
-            ego_vehicle, preceding_vehicle, target_speed
-        )
-
-        # Solve MPC problem
-        u_optimal = self.optimize_trajectory(x0, ref_traj, (lead_x, lead_y), lead_speed)
-
         # Extract control inputs
         acceleration = u_optimal[0]
         steering = u_optimal[1]
-
+        
         # Convert to CARLA control
         control = carla.VehicleControl()
-
+        
         # Convert acceleration to throttle/brake
         if acceleration >= 0:
-            control.throttle = min(
-                acceleration / 3.0, 1.0
-            )  # Assuming max accel of 3 m/s^2
+            control.throttle = min(acceleration / 3.0, 1.0)  # Assuming max accel of 3 m/s^2
             control.brake = 0.0
         else:
             control.throttle = 0.0
-            control.brake = min(
-                -acceleration / 5.0, 1.0
-            )  # Assuming max decel of 5 m/s^2
-
+            control.brake = min(-acceleration / 5.0, 1.0)  # Assuming max decel of 5 m/s^2
+        
         control.steer = steering / 0.5  # Normalize to [-1, 1]
-
+        
         return control
 
 class CarlaManager:
@@ -372,96 +329,13 @@ class CarlaManager:
                 )
 
 
-def generate_overtake_waypoints(
-    carla_manager,
-    vehicle,
-    direction="left",
-    distance_current_lane=10.0,
-    lane_change_step=2.0,
-    overtake_distance=50.0,
-    merge_distance=10.0,
-):
-    """
-    Generate a list of waypoints for an overtaking maneuver.
-
-    Args:
-        carla_manager: Instance of CarlaManager containing the map.
-        vehicle: The vehicle actor (rear vehicle).
-        direction (str): "left" or "right" lane change direction.
-        distance_current_lane (float): Distance to follow in current lane before lane change.
-        lane_change_step (float): Interval (in meters) to sample waypoints.
-        overtake_distance (float): Distance to follow in the adjacent lane.
-        merge_distance (float): Distance to follow in merging lane after overtaking.
-
-    Returns:
-        List of carla.Waypoint objects forming the overtaking trajectory.
-    """
-    _map = carla_manager.map
-    waypoints = []
-
-    # 1. Start in current lane.
-    current_wp = _map.get_waypoint(vehicle.get_location(), project_to_road=True)
-    waypoints.append(current_wp)
-
-    # Follow current lane for distance_current_lane
-    traveled = 0.0
-    last_wp = current_wp
-    while traveled < distance_current_lane:
-        next_wps = last_wp.next(lane_change_step)
-        if not next_wps:
-            break
-        next_wp = next_wps[0]
-        traveled += next_wp.transform.location.distance(last_wp.transform.location)
-        waypoints.append(next_wp)
-        last_wp = next_wp
-
-    # 2. Change lane: get the adjacent lane from the last waypoint
-    if direction == "left":
-        adjacent_wp = last_wp.get_left_lane()
-    else:
-        adjacent_wp = last_wp.get_right_lane()
-
-    if adjacent_wp is None:
-        print("No adjacent lane available in direction", direction)
-        return waypoints
-
-    waypoints.append(adjacent_wp)
-    last_wp = adjacent_wp
-
-    # 3. Follow adjacent lane for overtaking distance.
-    traveled = 0.0
-    while traveled < overtake_distance:
-        next_wps = last_wp.next(lane_change_step)
-        if not next_wps:
-            break
-        next_wp = next_wps[0]
-        traveled += next_wp.transform.location.distance(last_wp.transform.location)
-        waypoints.append(next_wp)
-        last_wp = next_wp
-
-    # 4. Merge back to the original lane.
-    if direction == "left":
-        merging_wp = last_wp.get_right_lane()
-    else:
-        merging_wp = last_wp.get_left_lane()
-
-    if merging_wp is not None:
-        waypoints.append(merging_wp)
-        last_wp = merging_wp
-        traveled = 0.0
-        while traveled < merge_distance:
-            next_wps = last_wp.next(lane_change_step)
-            if not next_wps:
-                break
-            next_wp = next_wps[0]
-            traveled += next_wp.transform.location.distance(last_wp.transform.location)
-            waypoints.append(next_wp)
-            last_wp = next_wp
-
-    return waypoints
-
-
 if __name__ == "__main__":
+    # import subprocess
+    # # ./CarlaUE4.sh -quality-level=Low
+
+    # subprocess.Popen(["/home/abdelrahman/CARLA_0.9.15/CarlaUE4.sh", "-quality-level=Low"])
+    # time.sleep(5)  # wait for Carla to start
+
     carla_manager = CarlaManager()
     print("CarlaManager is created")
 
@@ -487,7 +361,7 @@ if __name__ == "__main__":
     agent.set_destination(destination)
 
     # Spawn ego vehicle
-    SPAWN_LOCATION[0] += 10  # 10 meters behind preceding vehicle
+    SPAWN_LOCATION[0] += 20  # 15 meters behind preceding vehicle
     ego_vehicle = carla_manager.spawn_vehicle("vehicle.tesla.model3", SPAWN_LOCATION)
     time.sleep(1)  # allow the vehicle to spawn
 
