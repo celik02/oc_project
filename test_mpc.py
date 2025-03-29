@@ -11,7 +11,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import minimize
 
-dt = 0.01  # seconds
+dt = 0.1  # seconds
 SPAWN_LOCATION = [
     111.229362,
     13.511219,
@@ -19,7 +19,7 @@ SPAWN_LOCATION = [
 ]  # for spectator camera
 
 # synchronous_mode will make the simulation predictable
-synchronous_mode = True
+synchronous_mode = False
 
 
 def vehicle_dynamics(x, u, dt):
@@ -250,7 +250,6 @@ class CoordinateTransformManager:
         # Return as CARLA Vector3D
         return carla.Vector3D(x=global_vel[0], y=global_vel[1], z=global_vel[2])
     
-
 class MPCController:
     def __init__(self, horizon=10, dt=0.1, coordinate_manager=None):
         # Original initialization
@@ -318,8 +317,59 @@ class MPCController:
         
         return control
     
+    def ellipsoid_constraint(self, u, x0, lead_vehicle_pred, step_index):
+        """
+        Ellipsoid constraint function for collision avoidance
+        
+        Returns:
+        - Positive value: constraint satisfied (no collision)
+        - Negative value: constraint violated (collision)
+        
+        Args:
+            u: Flattened control sequence
+            x0: Initial state
+            lead_vehicle_pred: Predicted lead vehicle positions
+            step_index: Index in prediction horizon to evaluate
+        """
+        # Reshape control sequence
+        u_reshaped = u.reshape(-1, 2)
+        
+        # Simulate trajectory up to the specified step
+        x = x0.copy()
+        for i in range(step_index + 1):
+            if i < len(u_reshaped):
+                x = vehicle_dynamics(x, u_reshaped[i], self.dt)
+        
+        # Get lead vehicle position at this step
+        lead_x, lead_y = lead_vehicle_pred[step_index]
+        
+        # Define ellipsoid parameters (in meters)
+        a = 6.5  # Longitudinal semi-axis (front-back)
+        b = 2.5  # Lateral semi-axis (side-to-side)
+        
+        # Calculate relative position
+        dx = x[0] - lead_x
+        dy = x[1] - lead_y
+        
+        # Transform to lead vehicle's coordinate frame
+        # We need to account for the orientation of the lead vehicle
+        # For simplicity, we assume the lead vehicle is aligned with the road
+        # In a real implementation, you would use the lead vehicle's heading
+        theta = 0  # Simplified assumption
+        
+        # Perform coordinate rotation
+        dx_rot = dx * np.cos(theta) + dy * np.sin(theta)
+        dy_rot = -dx * np.sin(theta) + dy * np.cos(theta)
+        
+        # Ellipsoid constraint: (x/a)² + (y/b)² >= 1 means OUTSIDE the ellipsoid
+        # This is our safety condition: the ego vehicle must stay outside the ellipsoid
+        constraint_value = (dx_rot/a)**2 + (dy_rot/b)**2 - 1
+        
+        return constraint_value
+
     
     def solve_for_control(self, x0, lead_vehicle_pred, target_speed):
+        """Solve the MPC optimization problem with collision avoidance constraints"""
         # Initial guess - zeros for all controls
         u0 = np.zeros(self.horizon * 2)
         
@@ -329,6 +379,15 @@ class MPCController:
             bounds.append((self.min_accel, self.max_accel))
             bounds.append((self.min_steer, self.max_steer))
         
+        # Define ellipsoid constraints for all prediction steps
+        constraints = []
+        for i in range(self.horizon):
+            constraints.append({
+                'type': 'ineq',  # Inequality constraint (g(x) >= 0)
+                'fun': lambda u, i=i, x0=x0, lead_vehicle_pred=lead_vehicle_pred: 
+                    self.ellipsoid_constraint(u, x0, lead_vehicle_pred, i)
+            })
+        
         # Solve optimization problem with constraints
         result = minimize(
             self.objective_function,
@@ -336,12 +395,16 @@ class MPCController:
             args=(x0, lead_vehicle_pred),
             method="SLSQP",
             bounds=bounds,
-            options={"maxiter": 100}
+            constraints=constraints,
+            options={"maxiter": 10000}
         )
         
         # Extract optimal control sequence
+        # check feasibility
+        if not result.success:
+            print("Optimization failed:", result.message)
+            return np.zeros((self.horizon, 2))
         u_optimal = result.x.reshape(self.horizon, 2)
-        
         return u_optimal
     
     def get_lead_vehicle_prediction(self, lead_vehicle_state, lead_vehicle_speed):
@@ -524,26 +587,6 @@ class CarlaManager:
         Restart the world
         """
         self.client.reload_world()
-        self.world = self.client.get_world()
-        self.map = self.world.get_map()
-        self.blueprint_library = self.world.get_blueprint_library()
-        self.sampling_resolution = 0.5
-        self.global_planner = GlobalRoutePlanner(self.map, self.sampling_resolution)
-        self.fixed_delta_seconds = dt
-
-        self.spectator = self.world.get_spectator()
-        spectator_transform = carla.Transform(
-            carla.Location(
-                x=SPAWN_LOCATION[0] + 15, y=SPAWN_LOCATION[1], z=SPAWN_LOCATION[2]
-            ),
-            carla.Rotation(pitch=-37, yaw=-177, roll=0),
-        )
-        self.spectator.set_transform(spectator_transform)
-        if synchronous_mode:
-            self.settings = self.world.get_settings()
-            self.settings.fixed_delta_seconds = dt
-            self.settings.synchronous_mode = True
-            self.world.apply_settings(self.settings)
 
 
 
@@ -552,9 +595,7 @@ if __name__ == "__main__":
     print("CarlaManager is created")
 
     # Spawn preceding vehicle (in global coordinates)
-    preceding_vehicle = carla_manager.spawn_vehicle(
-        "vehicle.tesla.model3", SPAWN_LOCATION
-    )
+    preceding_vehicle = carla_manager.spawn_vehicle("vehicle.tesla.model3", SPAWN_LOCATION)
     preceding_vehicle.set_autopilot(False)
     time.sleep(1)  # allow the vehicle to spawn
 
@@ -563,50 +604,44 @@ if __name__ == "__main__":
     ego_vehicle = carla_manager.spawn_vehicle("vehicle.tesla.model3", SPAWN_LOCATION)
     time.sleep(1)  # allow the vehicle to spawn
 
+    # start autopilot controller for preciding vehicle
+    agent = BasicAgent(preceding_vehicle, target_speed=10)
+
+    # set destination for the preceding vehicle
+    current_location = preceding_vehicle.get_location()
+    current_wp = carla_manager.map.get_waypoint(current_location, project_to_road=True)
+    next_wps = current_wp.next(100.0)  # 100 meters ahead
+
+    if next_wps:  # if there is a waypoint ahead
+        destination = next_wps[0].transform.location
+    else:
+        destination = current_location
+    agent.set_destination(destination)  # choose a destination appropriately
+
     # Create coordinate transform manager using ego vehicle's spawn transform
     # This effectively makes the ego vehicle's spawn position the new origin
     ego_spawn_transform = ego_vehicle.get_transform()
     coord_manager = CoordinateTransformManager(ego_spawn_transform)
-    
+
     # The lane center y-coordinate in local coordinates would be 0 if the ego vehicle
     # spawned perfectly centered in the lane. Otherwise we need to determine this value.
     # We could either:
     # 1. Get the nearest waypoint and transform its y-coordinate to local
     # 2. Make an explicit calculation based on the lane width/positioning
     
-    # Get the nearest waypoint to get lane center
-    waypoint = carla_manager.map.get_waypoint(ego_vehicle.get_location())
-    lane_center_global = waypoint.transform.location
-    lane_center_local = coord_manager.global_to_local_location(lane_center_global)
-    lane_y_local = lane_center_local.y
-    print(f"Lane center y-coordinate in local frame: {lane_y_local}")
+    # # Get the nearest waypoint to get lane center
+    # waypoint = carla_manager.map.get_waypoint(ego_vehicle.get_location())
+    # lane_center_global = waypoint.transform.location
+    # lane_center_local = coord_manager.global_to_local_location(lane_center_global)
+    # lane_y_local = lane_center_local.y
+    # print(f"Lane center y-coordinate in local frame: {lane_y_local}")
     
-    # Basic control for preceding vehicle (still using CARLA's global coordinates)
-    agent = BasicAgent(preceding_vehicle, target_speed=10)
-    
-    # Set destination for the preceding vehicle (global coordinates)
-    current_location = preceding_vehicle.get_location()
-    current_wp = carla_manager.map.get_waypoint(current_location, project_to_road=True)
-    next_wps = current_wp.next(100.0)  # 100 meters ahead
-    
-    if next_wps:  # if there is a waypoint ahead
-        destination = next_wps[0].transform.location
-    else:
-        destination = current_location
-    agent.set_destination(destination)
-
     # Create MPC controller with coordinate manager
-    mpc_controller = MPCController(horizon=100, dt=0.1, coordinate_manager=coord_manager)
+    mpc_controller = MPCController(horizon=20, dt=0.1, coordinate_manager=coord_manager)
 
     # Target speed for ego vehicle (km/h)
     target_speed = 15.0
-    init_ego_control = carla.VehicleControl()
-    init_ego_control.steer = 0.0
-    init_ego_control.throttle = 1.0
-    init_ego_control.brake = 0.0
     
-    ego_vehicle.apply_control(init_ego_control)
-
     # Main control loop
     try:
         while True:
@@ -618,7 +653,8 @@ if __name__ == "__main__":
             ego_control = mpc_controller.run_step(
                 ego_vehicle, preceding_vehicle, target_speed / 3.6
             )  # Convert to m/s
-            ego_vehicle.apply_control(ego_control)
+            # ego_vehicle.apply_control(ego_control)
+
             print(f"Ego vehicle control: throttle={ego_control.throttle}, brake={ego_control.brake}, steer={ego_control.steer}")
 
             # Print current status in local coordinates for debugging
@@ -633,11 +669,12 @@ if __name__ == "__main__":
                 (ego_loc_local.y - lead_loc_local.y)**2
             )
             
-            carla_manager.world.tick()  # Step the world forward
             print(f"Ego vehicle global position: ({ego_loc_global.x:.2f}, {ego_loc_global.y:.2f}, {ego_loc_global.z:.2f})")
             print(f"Ego vehicle local position: ({ego_loc_local.x:.2f}, {ego_loc_local.y:.2f}, {ego_loc_local.z:.2f})")
             print(f"Lead vehicle local position: ({lead_loc_local.x:.2f}, {lead_loc_local.y:.2f}, {lead_loc_local.z:.2f})")
             print(f"Distance to lead vehicle: {distance:.2f} m")
+
+            time.sleep(0.05)
 
     except KeyboardInterrupt:
         print("Simulation terminated by user")
