@@ -1,0 +1,12 @@
+defaults:
+  - _self_
+  - ../gnss@gnss: gnss
+  - ../imu@imu: imu
+  - ../lidar@lidar: lidar
+  - ../camera@camera: camera
+seed: 0 # random seed
+imu_use: False # use imu data
+gnss_use: False # use gnss data
+lidar_use: True # use lidar data
+camera_use: True # use camera data
+
