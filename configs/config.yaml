@@ -1,0 +1,9 @@
+# configs/config.yaml
+defaults:
+  - imu: imu
+  - gnss: gnss
+
+hydra:
+  output_subdir: null
+  run:
+    dir: .

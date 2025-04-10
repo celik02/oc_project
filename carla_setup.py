@@ -4,7 +4,7 @@ from agents.navigation.constant_velocity_agent import ConstantVelocityAgent  # j
 from agents.navigation.basic_agent import BasicAgent
 from agents.navigation.controller import VehiclePIDController
 import time
-
+from hydra import initialize, compose
 
 dt = 0.1  # seconds
 SPAWN_LOCATION = [
@@ -14,7 +14,7 @@ SPAWN_LOCATION = [
 ]  # for spectator camera
 
 # synchronous_mode will make the simulation predictable
-synchronous_mode = False
+synchronous_mode = True
 
 
 class CarlaManager:
@@ -56,7 +56,7 @@ class CarlaManager:
             self.world.apply_settings(self.settings)
         self.client.apply_batch([carla.command.DestroyActor(x) for x in self.world.get_actors()])
 
-    def spawn_vehicle(self, blueprint_name, spawn_point):
+    def spawn_vehicle(self, blueprint_name, spawn_point, GPS=False, IMU=False):
         '''
         spawn a vehicle at the given spawn_point
         '''
@@ -68,6 +68,21 @@ class CarlaManager:
         print("Spawn rotation:", spawn_transform.rotation)
         blueprint = self.blueprint_library.filter(blueprint_name)[0]
         vehicle = self.world.spawn_actor(blueprint, spawn_transform)
+
+        if IMU or GPS:
+            with initialize(version_base='1.1', config_path="../configs", job_name="carla-manager"):
+                cfg = compose(config_name="config_e2e")
+
+        if IMU:
+            imu_bp = self.blueprint_library.find('sensor.other.imu')
+            imu_transform = carla.Transform(carla.Location(x=cfg.imu.location.x, y=cfg.imu.location.y, z=cfg.imu.location.z))
+            imu = self.world.spawn_actor(imu_bp, imu_transform, attach_to=vehicle)
+
+        if GPS:
+            gnss_bp = self.blueprint_library.find('sensor.other.gnss')
+            gnss_transform = carla.Transform(carla.Location(x=cfg.gnss.location.x, y=cfg.gnss.location.y, z=cfg.gnss.location.z))
+            gnss = self.world.spawn_actor(gnss_bp, gnss_transform, attach_to=vehicle)
+
         return vehicle
 
     def debug_waypoints(self, waypoints):
@@ -222,6 +237,7 @@ if __name__ == "__main__":
     ego_vehicle = carla_manager.spawn_vehicle("vehicle.tesla.model3", SPAWN_LOCATION)
     time.sleep(1)  # allow the vehicle to spawn
 
+    # TODO fix the waypoints for smooth lane change
     # generate overtaking waypoints
     waypoints = generate_overtake_waypoints(carla_manager, ego_vehicle,
                                             direction="left",
@@ -231,7 +247,7 @@ if __name__ == "__main__":
                                             merge_distance=10.0)
     # For debugging, you can visualize the waypoints:
     carla_manager.debug_waypoints(waypoints)
-    pid_controller = VehiclePIDController(ego_vehicle, {'K_P': 0.5}, {'K_P': 0.05, 'K_I': 0.05, 'K_D': 0.1})
+    pid_controller = VehiclePIDController(ego_vehicle, {'K_P': 0.9}, {'K_P': 0.01, 'K_I': 0.0, 'K_D': 0.5})
 
     current_wp_index = 0
     # main loop
@@ -244,4 +260,5 @@ if __name__ == "__main__":
         ego_control = pid_controller.run_step(20, next_overtake_wp)  # target speed 30 km/h
         ego_vehicle.apply_control(ego_control)
         # print('Specator location:', carla_manager.spectator.get_transform().location, 'rotation:', carla_manager.spectator.get_transform().rotation)
-        time.sleep(0.05)
+        carla_manager.world.tick()
+        # time.sleep(0.05)
