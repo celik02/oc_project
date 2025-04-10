@@ -1,3 +1,5 @@
+import sys
+print('\n'.join(sys.path))
 import carla
 from agents.navigation.global_route_planner import GlobalRoutePlanner  # type: ignore
 from agents.navigation.constant_velocity_agent import (
@@ -459,7 +461,7 @@ class CarlaManager:
 
     def __init__(self):
         self.client = carla.Client("localhost", 2000)
-        self.client.set_timeout(10.0)
+        self.client.set_timeout(60.0)
         self.client.load_world("Town04")
         self.world = self.client.get_world()
         self.map = self.world.get_map()
