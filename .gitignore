@@ -2,4 +2,8 @@ agents/navigation/__pycache__/
 agents/tools/__pycache__/
 agents/llm/__pycache__/
 agents/__pycache__/
+<<<<<<< HEAD
 */__pycache__/*
+=======
+__pycache__/
+>>>>>>> 1ba1872502e6706d801a1774b9d160aab4d8f26a
