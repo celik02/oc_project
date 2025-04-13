@@ -6,6 +6,16 @@ import copy
 import time
 import threading
 from numpy import dot
+import logging
+import sys
+# global logger settings
+FORMAT = "[%(filename)26s:%(lineno)3s - %(funcName)27s() ] %(levelname)s %(message)s"
+logging.basicConfig(level=logging.INFO, stream=sys.stdout, force=True, format=FORMAT)
+
+# local logger settings
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
 state_dim = 5  # State dimension
 measurement_dim = 2  # Measurement dimension
 control_dim = 2  # Control dimension
@@ -21,10 +31,10 @@ class CustomEKF(ExtendedKalmanFilter):
         if u is not None:
             self.u = u
         # F updated with the current state estimate and control input
-        print('inside custom predict_x with u:', u)
+        logger.debug('inside custom predict_x with u:%s', u)
         self.F = self.F_jacobian(self.x, dt, self.u)
         self.x = self.vehicle_dynamics(self.x, dt, self.u)  # state prediction
-        print('Predicting state:', self.x)
+        logger.debug('Predicting state:%s', self.x)
 
     def predict_x_imu(self, imu_data=None, dt=0.01):
         """
@@ -44,7 +54,7 @@ class CustomEKF(ExtendedKalmanFilter):
         self.x = self.vehicle_dynamics(self.x, dt, u=u, imu_prediction=True)  # state prediction
 
         # self.P = dot(self.F, self.P).dot(self.F.T) + self.Q  # this is prior
-        print('Predicting with IMU data:', self.x)
+        logger.debug('Predicting with IMU data:%s', self.x)
 
     def predict(self, u=None):
         self.predict_x(u)
@@ -55,7 +65,7 @@ class CustomEKF(ExtendedKalmanFilter):
         self.P_prior = np.copy(self.P)
 
     def update(self, z, R=None, residual=np.subtract):
-        print('inside update:', z)
+        logger.debug('inside update:%s', z)
         super().update(z, HJacobian=self.HJacobian_GPS, Hx=self.Hx, R=R,
                        residual=residual)
         self.u = None  # Reset control input after update
@@ -93,7 +103,7 @@ class CustomEKF(ExtendedKalmanFilter):
             x_next[2] = x[2] + x[3] * np.tan(delta) / L * dt
         x_next[3] = x[3] + x[4] * dt
         x_next[4] = x[4] + (a - x[4]) / tau_a * dt
-        print('xnext:', x_next)
+        logger.debug('xnext: %s', x_next)
         return x_next
 
     @staticmethod
@@ -254,8 +264,10 @@ if __name__ == "__main__":
         u = np.array([1.5, 0.5])
         # Plot the current state
         ekf_state_x = ego_vehicle.get_latest_state()
-
-        print('frenet states:', ego_vehicle.get_frenet_states())
+        current_location = ego_vehicle.actor.get_location()
+        current_wp = carla_manager.map.get_waypoint(current_location, project_to_road=True)
+        next_waypoint = current_wp.next(2)[0]
+        print('frenet states:', ego_vehicle.get_frenet_states(next_waypoint))
 
         plt.scatter(ekf_state_x[0], ekf_state_x[1], color='r', marker='x', label='EKF Estimate')  # Plot EKF estimated position
         plt.scatter(ego_vehicle.actor.get_transform().location.x,
@@ -273,9 +285,13 @@ if __name__ == "__main__":
         spectator_location.location.z += 5
         spectator_location.location.x += 5
         carla_manager.spectator.set_transform(spectator_location)  # Keep the spectator camera in the same location
-
         # update the world
+        # add some noise to vehicle control
+        ego_control = ego_vehicle.actor.get_control()
+        ego_control.throttle += np.random.normal(0, 0.5)
+        ego_control.steer += np.random.normal(0, 0.1)
+        ego_vehicle.actor.apply_control(ego_control)
         carla_manager.world.tick()
-        plt.pause(0.5)
+        plt.pause(0.1)
     ekf_thread.join()  # Ensure the EKF update loop thread is joined before exiting
     carla_manager.__del__()  # Clean up the Carla manager and close the simulation

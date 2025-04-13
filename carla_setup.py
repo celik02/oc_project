@@ -248,6 +248,7 @@ if __name__ == "__main__":
         destination = next_wps[0].transform.location
     else:
         destination = current_location
+
     agent.set_destination(destination)  # choose a destination appropriately
 
     # spawn ego vehicle

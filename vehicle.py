@@ -7,6 +7,9 @@ import traceback
 from scipy.optimize import least_squares
 import carla
 import math
+import logging
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 
 class Vehicle:
@@ -29,6 +32,10 @@ class Vehicle:
         # TODO set initial state of EKF
         # self.ekf.x = np.array([0, 0, 0, 0, 0])  # Example initial state
         self.carla_coords = np.array([0.0, 0.0, 0.0])  # Placeholder for GPS coordinates
+
+        # initialize states
+        self.s = 0
+        self.prev_loc = self.actor.get_transform().location
 
     def attach_sensors(self, GPS=None, IMU=None):
         """
@@ -173,7 +180,7 @@ class Vehicle:
             np.radians(
                 self.waypoint.transform.rotation.yaw
                 - (
-                    self.vehicle.get_transform().rotation.yaw
+                    self.actor.get_transform().rotation.yaw
                     + np.arctan(steering_angle / self.wheel_base)
                 )
             )
@@ -182,8 +189,8 @@ class Vehicle:
 
         self.s += self.calculate_progress()
 
-        d = self.calculate_deviation(self, self.waypoint)
-        state_data = np.array([self.s, d, -mu, speed, steering_angle, curvature])
+        d = self.calculate_deviation(self.waypoint)
+        state_data = np.array([self.s, d, mu, speed, steering_angle, curvature])
 
         return state_data, self.waypoint
 
@@ -193,7 +200,8 @@ class Vehicle:
         """
         # Get the current location and heading of the vehicle
         vehicle_location = self.actor.get_location()
-
+        logger.debug(f"Vehicle location: {vehicle_location}")
+        logger.debug(f"next wp location: {waypoint.transform.location}")
         # Get the map and the waypoint at the vehicle's location
 
         # Get the lane center and lane direction
@@ -219,14 +227,14 @@ class Vehicle:
             lane_direction.x * vehicle_vector.y - lane_direction.y * vehicle_vector.x
         )
 
-        # Calculate the Euclidean distance for the deviation
-        deviation = math.sqrt(vehicle_vector.x**2 + vehicle_vector.y**2)
+        # # Calculate the Euclidean distance for the deviation
+        # deviation = math.sqrt(vehicle_vector.x**2 + vehicle_vector.y**2)
 
-        # Apply the sign based on the cross product
-        if cross_product_z < 0:
-            deviation = -deviation
+        # # Apply the sign based on the cross product
+        # if cross_product_z < 0:
+        #     deviation = -deviation
 
-        return deviation
+        return cross_product_z
 
     def calculate_progress(self):
         """
@@ -235,7 +243,7 @@ class Vehicle:
         - s (float): The progress along the lane.
         """
         # Get the vehicle's transform
-        vehicle_transform = self.vehicle.get_transform()
+        vehicle_transform = self.actor.get_transform()
         vehicle_location = vehicle_transform.location
         s = vehicle_location.distance(self.prev_loc)
         self.prev_loc = vehicle_location
