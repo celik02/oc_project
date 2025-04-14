@@ -617,9 +617,13 @@ if __name__ == "__main__":
             preceding_vehicle.apply_control(control_cmd)
 
             # Control ego vehicle with MPC (will use local coordinates internally)
-            ego_control = mpc_controller.run_step(
-                ego_vehicle, preceding_vehicle, target_speed / 3.6
-            )  # Convert to m/s
+            # ego_control = mpc_controller.run_step(
+                # ego_vehicle, preceding_vehicle, target_speed / 3.6
+            # )  # Convert to m/s
+            ego_control = carla.VehicleControl()
+            ego_control.steer = 0.0
+            ego_control.throttle = 1.0
+            ego_control.brake = 0.0
             ego_vehicle.apply_control(ego_control)
             print(f"Ego vehicle control: throttle={ego_control.throttle}, brake={ego_control.brake}, steer={ego_control.steer}")
 
