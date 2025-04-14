@@ -54,9 +54,9 @@ class CarlaManager:
         if synchronous_mode:
             self.settings.synchronous_mode = False
             self.world.apply_settings(self.settings)
-        self.client.apply_batch([carla.command.DestroyActor(x) for x in self.world.get_actors()])
+        # self.client.apply_batch([carla.command.DestroyActor(x) for x in self.world.get_actors()])
 
-    def spawn_vehicle(self, blueprint_name, spawn_point, GPS=False, IMU=False):
+    def spawn_vehicle(self, blueprint_name, spawn_point, role_name='default', GPS=False, IMU=False):
         '''
         spawn a vehicle at the given spawn_point
         '''
@@ -67,23 +67,41 @@ class CarlaManager:
         print("Spawn location:", spawn_transform.location)
         print("Spawn rotation:", spawn_transform.rotation)
         blueprint = self.blueprint_library.filter(blueprint_name)[0]
+        blueprint.set_attribute("role_name", role_name)
         vehicle = self.world.spawn_actor(blueprint, spawn_transform)
 
         if IMU or GPS:
-            with initialize(version_base='1.1', config_path="../configs", job_name="carla-manager"):
-                cfg = compose(config_name="config_e2e")
+            with initialize(version_base='1.1', config_path="configs", job_name="carla-manager"):
+                cfg = compose(config_name="config")
 
         if IMU:
             imu_bp = self.blueprint_library.find('sensor.other.imu')
+
+            # add noise to IMU if specified in the config
+            imu_bp.set_attribute('noise_accel_stddev_x', str(cfg.imu.noise_accel_stddev_x))
+            imu_bp.set_attribute('noise_gyro_stddev_z', str(cfg.imu.noise_gyro_stddev_z))
+            # add noise seed if specified in the config (for reproducibility)
+            imu_bp.set_attribute('noise_seed', str(cfg.imu.noise_seed))
+
             imu_transform = carla.Transform(carla.Location(x=cfg.imu.location.x, y=cfg.imu.location.y, z=cfg.imu.location.z))
             imu = self.world.spawn_actor(imu_bp, imu_transform, attach_to=vehicle)
 
         if GPS:
             gnss_bp = self.blueprint_library.find('sensor.other.gnss')
+
+            # add noise to GNSS if specified in the config
+            gnss_bp.set_attribute('noise_lat_stddev', str(cfg.gnss.noise_lat_stddev))
+            gnss_bp.set_attribute('noise_lon_stddev', str(cfg.gnss.noise_lon_stddev))
+            # add noise seed if specified in the config (for reproducibility)
+            gnss_bp.set_attribute('noise_seed', str(cfg.gnss.noise_seed))
+
             gnss_transform = carla.Transform(carla.Location(x=cfg.gnss.location.x, y=cfg.gnss.location.y, z=cfg.gnss.location.z))
             gnss = self.world.spawn_actor(gnss_bp, gnss_transform, attach_to=vehicle)
 
-        return vehicle
+        if IMU or GPS:
+            return vehicle, imu, gnss
+        else:
+            return vehicle
 
     def debug_waypoints(self, waypoints):
         # draw trace_route outputs
@@ -230,6 +248,7 @@ if __name__ == "__main__":
         destination = next_wps[0].transform.location
     else:
         destination = current_location
+
     agent.set_destination(destination)  # choose a destination appropriately
 
     # spawn ego vehicle
