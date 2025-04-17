@@ -1,0 +1,696 @@
+import time
+import numpy as np
+
+import carla
+from agents.navigation.global_route_planner import GlobalRoutePlanner  # type: ignore
+from agents.navigation.basic_agent import BasicAgent
+from vehicle import Vehicle  # Import the Vehicle class
+
+import casadi as ca
+
+dt = 0.1  # seconds
+SPAWN_LOCATION = [
+    111.229362,
+    13.511219,
+    14.171306,
+]  # for spectator camera
+
+# synchronous_mode will make the simulation predictable
+synchronous_mode = False
+
+
+def frenet_vehicle_dynamics(x, u, dt):
+    """ Vehicle dynamics in Frenet coordinates using numpy instead of CasADi
+    Vehicle dynamics in Frenet coordinates
+    x: state vector [s, d, mu, v, delta, kappa]
+    u: control input [accel, steer]
+    dt: time step
+    """
+    # Vehicle parameters
+    L = 2.875  # Wheelbase
+    
+    # State update using numpy operations
+    s_next = x[0] + x[3] * np.cos(x[2]) * dt  # Longitudinal position
+    d_next = x[1] + x[3] * np.sin(x[2]) * dt  # Lateral position
+    mu_next = x[2] + x[3] * np.tan(x[4]) / L * dt  # Heading angle
+    v_next = x[3] + u[0] * dt 
+    delta_next = u[1] 
+    kappa_next = x[5]  # we do not use curvature in our work
+    
+    # Return next state as a numpy array
+    return np.array([s_next, d_next, mu_next, v_next, delta_next, kappa_next])
+    
+
+def frenet_vehicle_dynamics_casadi(x, u, dt):
+    """
+    Adapted CasADi version for the modified state representation
+    """
+    # Vehicle parameters
+    L = 2.875  # Wheelbase
+    
+    # State update using CasADi expressions
+    s_next = x[0] + x[3] * ca.cos(x[2]) * dt # Longitudinal position
+    d_next = x[1] + x[3] * ca.sin(x[2]) * dt # Lateral position
+    mu_next = x[2] + x[3] * ca.tan(x[4]) / L * dt # Heading angle
+    v_next = x[3] + u[0] * dt 
+    delta_next = u[1] 
+    kappa_next = x[5]  # we do not use curvature in our work
+    
+    # Return next state as a CasADi column vector
+    return ca.vertcat(s_next, d_next, mu_next, v_next, delta_next, kappa_next)
+
+
+class FrenetMPCController:
+    def __init__(self, horizon=10, dt=0.1, carla_manager=None):
+        self.carla_manager = carla_manager
+
+        self.horizon = horizon
+        self.dt = dt
+        
+        # Control constraints
+        self.max_accel = 3.0
+        self.min_accel = -3.0
+        self.max_steer = np.pi / 4  # Max steering allowed (rad)
+        self.min_steer = -np.pi / 4  # Min steering allowed (rad)
+                
+        # Cost function weights
+        self.w_progress = 5.0    # Forward progress reward
+        self.w_lane = 2.0        # Lane centering reward
+        self.w_speed = 0.0       # Target speed reward
+        self.w_accel = 0.0       # Acceleration minimization
+        self.w_steer = 0.0       # Steering minimization
+        self.w_jerk = 0.0        # Jerk minimization
+
+        # Lane change parameters
+        self.lane_width = 3.5    # Standard lane width in meters
+        self.current_lane = 0    # Middle lane (0), left lane (-1), right lane (1)
+        self.target_lane = 0     # Initially target the current lane
+        
+        # Initialize CasADi solver (will be created the first time we run)
+        self.solver = None
+        self.casadi_setup_done = False
+        
+    def run_step(self, ego_vehicle, preceding_vehicle, target_speed, next_waypoint):
+        """
+        Execute one step of MPC control using Frenet coordinates
+        
+        Args:
+            ego_vehicle: Vehicle class instance for ego vehicle
+            preceding_vehicle: Vehicle class instance for preceding vehicle
+            target_speed: Desired speed in m/s
+            next_waypoint: Waypoint for Frenet coordinate calculation
+            
+        Returns:
+            carla.VehicleControl object
+        """
+            
+        # Get Frenet states for ego vehicle
+        ego_frenet, waypoint = ego_vehicle.get_frenet_states(next_waypoint)
+        
+        # Extract ego states - now using the full state vector from Vehicle class
+        s0, d0, mu0, v0, steering0, curvature0 = ego_frenet
+            
+        # Then update x0 with the stabilized heading
+        x0 = np.array([s0, d0, mu0, v0, steering0, curvature0])
+        
+        # Get Frenet states for preceding vehicle using the same waypoint reference
+        lead_frenet, _ = preceding_vehicle.get_frenet_states(next_waypoint)
+        lead_s, lead_d, _, lead_speed, _, _ = lead_frenet
+
+        # Print diagnostic information about the Frenet coordinates
+        print(f"Ego Frenet: s={s0:.2f}, d={d0:.2f}, v={v0:.2f}")
+        print(f"Lead Frenet: s={lead_s:.2f}, d={lead_d:.2f}, v={lead_speed:.2f}")
+        
+        # Calculate relative distance in world coordinates
+        ego_location = ego_vehicle.actor.get_location()
+        lead_location = preceding_vehicle.actor.get_location()
+        
+        # Project the relative position onto the Frenet frame
+        relative_position = carla.Location(
+            lead_location.x - ego_location.x,
+            lead_location.y - ego_location.y,
+            lead_location.z - ego_location.z
+        )
+        
+        # Get the road direction at the waypoint (tangent to the road)
+        waypoint_yaw = np.radians(waypoint.transform.rotation.yaw)
+        road_direction = np.array([np.cos(waypoint_yaw), np.sin(waypoint_yaw)])
+        
+        # Project the relative position onto the road direction for longitudinal distance (s)
+        relative_s = relative_position.x * road_direction[0] + relative_position.y * road_direction[1]
+        
+        # Compare Frenet-derived distance with actual world distance
+        print(f"World-space relative s: {relative_s:.2f}")
+        
+        # Calculate desired lateral position based on target lane
+        d_desired = self.target_lane * self.lane_width
+        print(f"Target lane: {self.target_lane}, d_desired: {d_desired:.2f}")
+        
+        # Generate lead vehicle prediction in Frenet coordinates
+        lead_vehicle_pred = self.get_lead_vehicle_prediction(relative_s, lead_d, lead_speed)
+        
+        # Solve optimization problem with CasADi
+        if not self.casadi_setup_done:
+            self.setup_casadi_solver()
+            self.casadi_setup_done = True
+            
+        # When calling solve_with_casadi, pass the updated state vector
+        u_optimal = self.solve_with_casadi(x0, lead_vehicle_pred, target_speed, d_desired)        
+
+        print("Control action", u_optimal[0])
+        # Convert to CARLA control, adapting to use acceleration and steering rate
+        control = self.convert_to_control(u_optimal[0])  # Pass current steering angle
+        
+        return control
+    
+    def setup_casadi_solver(self):
+        """
+        Setup the CasADi solver for MPC optimization with adapted state representation.
+        """
+        print("Setting up CasADi solver...")
+        
+        # State variables (symbolic) - now 6 dimensions
+        x = ca.SX.sym('x', 6)  # [s, d, mu, v, steering, curvature]
+        
+        # Control variables (symbolic) - now [accel, steering]
+        u = ca.SX.sym('u', 2)  # [accel, steering]
+        
+        # Define parameters that will change each time step
+        # Initial state
+        x0 = ca.SX.sym('x0', 6)
+        
+        # Lead vehicle predicted positions (for all steps in horizon)
+        lead_s_pred = ca.SX.sym('lead_s_pred', self.horizon)
+        lead_d_pred = ca.SX.sym('lead_d_pred', self.horizon)
+        
+        # Target speed and desired lateral position
+        target_speed = ca.SX.sym('target_speed', 1)
+        d_desired = ca.SX.sym('d_desired', 1)
+        
+        # Define the dynamics function with adapted model
+        dynamics_func = ca.Function('dynamics', [x, u], 
+                                [frenet_vehicle_dynamics_casadi(x, u, self.dt)])
+        
+        # Initialize the cost function and constraints
+        obj = 0
+        g = []  # Constraints
+        lbg = []  # Lower bounds for constraints
+        ubg = []  # Upper bounds for constraints
+        
+        # State bounds for lane boundaries (simplified from the lane_boundary_constraint)
+        lane_boundaries = [-self.lane_width*1.5, -self.lane_width*0.5, self.lane_width*0.5, self.lane_width*1.5]
+        safe_margin = 0.3  # meters
+        
+        # Setup decision variables
+        opt_vars = []
+        opt_vars_lb = []
+        opt_vars_ub = []
+        
+        # Initial conditions
+        xk = x0
+        
+        # Define the optimization variables for each step
+        for k in range(self.horizon):
+            # Control at the current step
+            uk = ca.SX.sym(f'u_{k}', 2)
+            opt_vars.append(uk)
+            opt_vars_lb.extend([self.min_accel, self.min_steer])
+            opt_vars_ub.extend([self.max_accel, self.max_steer])
+            
+            # In the for k in range(self.horizon) loop:
+
+            # 1. Progress reward (using distance along the lane)
+            obj -= self.w_progress * xk[0]  # Forward progress reward
+
+            # 2. Lane centering
+            obj += self.w_lane * (xk[1] - d_desired)**2
+
+            # 3. Target speed
+            obj += self.w_speed * (target_speed - xk[3])**2
+
+            # 4. Control effort - now penalizing acceleration and steering rate
+            obj += self.w_accel * uk[0]**2  # Acceleration
+            obj += self.w_steer * uk[1]**2  # Steering rate (not steering angle)
+
+            # 5. Jerk minimization - adapt if needed based on new control definition
+            if k > 0:
+                prev_uk = opt_vars[-3]  # Two items back in the list
+                obj += self.w_jerk * ((uk[0] - prev_uk[0]) / self.dt)**2  # Jerk penalty (accel rate)     
+
+            # Lead vehicle position at this step
+            lead_s_k = lead_s_pred[k]
+            lead_d_k = lead_d_pred[k]
+                        
+            # Collision avoidance constraint (ellipsoid)
+            # Define ellipsoid parameters
+            a = 5.0  # Longitudinal semi-axis (front-back)
+            b = 2.0  # Lateral semi-axis (side-to-side)
+            
+            # Calculate distances in Frenet coordinates
+            ds = (lead_s_k) - xk[0]  # Longitudinal distance
+            dd = lead_d_k - xk[1]  # Lateral distance
+            
+            # Add collision avoidance constraint
+            # We want (ds/a)² + (dd/b)² >= 1 (outside the ellipsoid)
+            g.append((ds/a)**2 + (dd/b)**2)
+            lbg.append(1.0)  # Lower bound: must be greater than 1 to stay outside
+            ubg.append(ca.inf)  # Upper bound: infinity
+            
+            # # Lane boundary constraints
+            # # Calculate distance to each lane boundary
+            # for boundary in lane_boundaries:
+            #     margin = ca.fabs(xk[1] - boundary)
+            #     # Add a constraint that margin should be greater than safe_margin
+            #     g.append(margin)
+            #     lbg.append(safe_margin)
+            #     ubg.append(ca.inf)
+            
+            # State propagation - get the next state
+            xk_next = dynamics_func(xk, uk)
+            
+            # Add dynamics constraints (next state must follow the dynamics model)
+            if k < self.horizon - 1:
+                # When creating opt_vars:
+                # For each state variable, we need to define a new symbolic variable for the next state
+                xk_next_sym = ca.SX.sym(f'x_{k+1}', 6)  # Now 6-dimensional
+                opt_vars.append(xk_next_sym)
+                
+                # No bounds on states except for practical limits, adjusted for 6D state
+                opt_vars_lb.extend([-ca.inf, -ca.inf, -ca.inf, 0, -ca.inf, -ca.inf])  # v >= 0
+                opt_vars_ub.extend([ca.inf, ca.inf, ca.inf, 40, ca.inf, ca.inf])
+                
+                # Add the dynamics constraint: next state must equal dynamics model
+                g.append(xk_next_sym - xk_next)
+                lbg.extend([0, 0, 0, 0, 0, 0])  # Equality constraints for 6D state
+                ubg.extend([0, 0, 0, 0, 0, 0])
+                
+                # Update state for next iteration
+                xk = xk_next_sym
+            
+        # Pack all optimization variables into a single vector
+        opt_vars = ca.vertcat(*opt_vars)
+        
+        # Create the NLP problem
+        nlp = {
+            'x': opt_vars,
+            'f': obj,
+            'g': ca.vertcat(*g),
+            'p': ca.vertcat(x0, lead_s_pred, lead_d_pred, target_speed, d_desired)
+        }
+        
+        # Configure the solver
+        opts = {
+            'ipopt': {
+                'print_level': 0,         # 0 for no output
+                'max_iter': 10000,          # Maximum number of iterations
+                'acceptable_tol': 1e-4,   # Tolerance
+                'warm_start_init_point': 'yes'  # Use warm starting
+            },
+            'print_time': False
+        }
+
+        # Store constraint bounds when creating the problem
+        self.lbg = lbg  # Store lower bounds for constraints
+        self.ubg = ubg  # Store upper bounds for constraints
+        
+        # Create the solver
+        self.solver = ca.nlpsol('solver', 'ipopt', nlp, opts)
+        
+        # Store information about the problem dimensions
+        self.num_states = 6
+        self.num_controls = 2
+        self.opt_vars_size = opt_vars.size1()
+        
+        print("CasADi solver setup complete!")
+    
+    def solve_with_casadi(self, x0, lead_vehicle_pred, target_speed, d_desired):
+        """
+        Solve the MPC problem using the CasADi solver
+        
+        Args:
+            x0: Initial state [s, d, mu, v, a]
+            lead_vehicle_pred: Predicted lead vehicle positions [(s,d), ...]
+            target_speed: Desired speed in m/s
+            d_desired: Desired lateral position
+            
+        Returns:
+            Optimal control sequence
+        """
+        try:
+            # Extract lead vehicle prediction data
+            lead_s_pred = np.array([pred[0] for pred in lead_vehicle_pred])
+            lead_d_pred = np.array([pred[1] for pred in lead_vehicle_pred])
+            
+            # Define initial guess (all zeros)
+            x_init = np.zeros(self.opt_vars_size)
+            
+            # Pack parameters with 6D state
+            p = np.concatenate([
+                x0.flatten(),  # Now 6D
+                lead_s_pred.flatten(),
+                lead_d_pred.flatten(),
+                [target_speed],
+                [d_desired]
+            ])
+            
+            # Lower and upper bounds for variables, adjusted for 6D state
+            lbx = []
+            ubx = []
+            
+            # For each time step, add control bounds
+            for _ in range(self.horizon):
+                lbx.extend([self.min_accel, self.min_steer])
+                ubx.extend([self.max_accel, self.max_steer])
+                
+                # If not the last step, add state bounds
+                if _ < self.horizon - 1:
+                    # Bounds for 6D state
+                    lbx.extend([-np.inf, -np.inf, -np.inf, 0, -np.inf, -np.inf])
+                    ubx.extend([np.inf, np.inf, np.inf, 40, np.inf, np.inf])
+            
+            # Solve the optimization problem with stored constraint bounds
+            sol = self.solver(
+                x0=x_init,
+                lbx=lbx,
+                ubx=ubx,
+                lbg=self.lbg,  # Use stored lower bounds
+                ubg=self.ubg,  # Use stored upper bounds
+                p=p
+            )
+            
+            # Extract the optimal control sequence
+            x_opt = sol['x'].full().flatten()
+            
+            # Reshape to get control sequence - adjusted for the 6+2 dimensionality
+            u_optimal = []
+            for i in range(self.horizon):
+                idx = i * (self.num_controls + self.num_states) if i < self.horizon - 1 else i * 2
+                u_i = x_opt[idx:idx+2]
+                u_optimal.append(u_i)
+                
+            return np.array(u_optimal)
+                        
+        except Exception as e:
+            print(f"CasADi optimization failed: {e}")
+            
+    def get_lead_vehicle_prediction(self, lead_s, lead_d, lead_speed):
+        """
+        Predict lead vehicle trajectory in Frenet coordinates (constant velocity model)
+        """
+        predictions = []
+        s_lead = lead_s
+        d_lead = lead_d
+
+        for i in range(self.horizon):
+            # Assume constant velocity in s direction, constant d position
+            s_lead = s_lead + lead_speed * self.dt
+            predictions.append((s_lead, d_lead))
+
+        return predictions
+    
+    def convert_to_control(self, u_optimal):
+        """
+        Convert MPC control output to CARLA control
+        
+        Args:
+            u_optimal: Optimal control input [acceleration, steering]
+            current_steering: Current steering angle
+        
+        Returns:
+            carla.VehicleControl object
+        """
+        # Extract control inputs
+        acceleration = u_optimal[0]
+        steering = u_optimal[1]
+        
+        # Convert to CARLA control
+        control = carla.VehicleControl()
+        
+        # Convert acceleration to throttle/brake
+        if acceleration >= 0:
+            control.throttle = min(acceleration / self.max_accel, 1.0)  # Assuming max accel of 3 m/s^2
+            control.brake = 0.0
+        else:
+            control.throttle = 0.0
+            control.brake = min(-acceleration / self.max_accel, 1.0)  # Assuming max decel of 3 m/s^2
+        
+        # Apply steering rate by converting to steering command
+        # max steering angle is 69.99999237060547 degrees
+        # max steering from degrees to radians
+        max_steering_angle = np.radians(69.99999237060547) 
+        # Note: CARLA expects steering in [-1, 1] range
+        control.steer = steering
+        # map the steering from radians to [-1, 1] range
+        control.steer = control.steer / max_steering_angle
+        control.steer = np.clip(control.steer, -1.0, 1.0)  # Clip to valid range
+        
+        return control
+
+
+class CarlaManager:
+    _instance = None
+
+    def __new__(cls, *args, **kwargs):  # to make this class singleton
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __init__(self):
+        self.client = carla.Client("localhost", 2000)
+        self.client.set_timeout(10.0)
+        self.client.load_world("Town04")
+        self.world = self.client.get_world()
+        self.map = self.world.get_map()
+        self.blueprint_library = self.world.get_blueprint_library()
+        self.sampling_resolution = 0.5
+        self.global_planner = GlobalRoutePlanner(self.map, self.sampling_resolution)
+        self.fixed_delta_seconds = dt
+
+        self.spectator = self.world.get_spectator()
+        spectator_transform = carla.Transform(
+            carla.Location(
+                x=SPAWN_LOCATION[0] + 15, y=SPAWN_LOCATION[1], z=SPAWN_LOCATION[2]
+            ),
+            carla.Rotation(pitch=-37, yaw=-177, roll=0),
+        )
+        self.spectator.set_transform(spectator_transform)
+        if synchronous_mode:
+            self.settings = self.world.get_settings()
+            self.settings.fixed_delta_seconds = dt
+            self.settings.synchronous_mode = True
+            self.world.apply_settings(self.settings)
+
+    def __del__(self):
+        if synchronous_mode:
+            self.settings.synchronous_mode = False
+            self.world.apply_settings(self.settings)
+        self.client.apply_batch(
+            [carla.command.DestroyActor(x) for x in self.world.get_actors()]
+        )
+
+    def spawn_vehicle(self, blueprint_name, spawn_point):
+        """
+        spawn a vehicle at the given spawn_point
+        """
+        spawn_transform = self.map.get_waypoint(
+            carla.Location(x=spawn_point[0], y=spawn_point[1], z=10),
+            project_to_road=True,
+        ).transform
+        spawn_transform.location.z = spawn_transform.location.z + 0.5
+        print("Spawn location:", spawn_transform.location)
+        print("Spawn rotation:", spawn_transform.rotation)
+        blueprint = self.blueprint_library.filter(blueprint_name)[0]
+        vehicle = self.world.spawn_actor(blueprint, spawn_transform)
+        return vehicle
+
+    def debug_waypoints(self, waypoints):
+        # draw trace_route outputs
+        i = 0
+        for w in waypoints:
+            if i % 10 == 0:
+                self.world.debug.draw_string(
+                    w.transform.location,
+                    "O",
+                    draw_shadow=False,
+                    color=carla.Color(r=255, g=0, b=0),
+                    life_time=120.0,
+                    persistent_lines=True,
+                )
+
+    def restart_world(self):
+        """
+        Restart the world by removing all actors and reloading the world
+        """
+        print("Cleaning up the world...")
+        
+        # First destroy all vehicles, sensors and other actors
+        actor_list = self.world.get_actors()
+        for actor in actor_list:
+            # Check if actor is not already destroyed
+            if actor.is_alive:
+                # Only destroy vehicles and sensors (not static world objects)
+                if actor.type_id.startswith('vehicle') or actor.type_id.startswith('sensor'):
+                    try:
+                        actor.destroy()
+                        print(f"Destroyed {actor.type_id}")
+                    except Exception as e:
+                        print(f"Error destroying {actor.type_id}: {e}")
+        
+        # Reset the simulation settings if in synchronous mode
+        if synchronous_mode:
+            self.settings = self.world.get_settings()
+            self.settings.synchronous_mode = False
+            self.world.apply_settings(self.settings)
+            print("Reset simulation to asynchronous mode")
+            
+        # Reload the world (a lighter operation than restarting Carla)
+        print("Reloading world...")
+        self.client.reload_world()
+        self.world = self.client.get_world()
+        self.map = self.world.get_map()
+        self.blueprint_library = self.world.get_blueprint_library()
+        self.sampling_resolution = 0.5
+        self.global_planner = GlobalRoutePlanner(self.map, self.sampling_resolution)
+        self.fixed_delta_seconds = dt
+
+        # Reset spectator position
+        self.spectator = self.world.get_spectator()
+        spectator_transform = carla.Transform(
+            carla.Location(
+                x=SPAWN_LOCATION[0] + 15, y=SPAWN_LOCATION[1], z=SPAWN_LOCATION[2]
+            ),
+            carla.Rotation(pitch=-37, yaw=-177, roll=0),
+        )
+        self.spectator.set_transform(spectator_transform)
+        
+        # Restore synchronous mode if needed
+        if synchronous_mode:
+            self.settings = self.world.get_settings()
+            self.settings.fixed_delta_seconds = dt
+            self.settings.synchronous_mode = True
+            self.world.apply_settings(self.settings)
+            print("Restored synchronous mode")
+            
+        print("World has been successfully reset")
+
+def run_simulation_with_casadi():
+    """
+    Run the main simulation with CasADi-based MPC controller
+    """
+    print("Starting simulation with CasADi MPC controller...")
+    
+    # Create CarlaManager instance
+    carla_manager = CarlaManager()
+    print("CarlaManager is created")
+    
+    preceding_vehicle_actor = None
+    ego_vehicle_actor = None
+    
+    try:
+        # Spawn preceding vehicle (stationary)
+        preceding_vehicle_actor = carla_manager.spawn_vehicle(
+            "vehicle.tesla.model3", SPAWN_LOCATION
+        )
+
+        preceding_vehicle_actor.set_autopilot(False)
+        time.sleep(1)  # allow the vehicle to spawn
+        
+        # Wrap with Vehicle class
+        preceding_vehicle = Vehicle(preceding_vehicle_actor)
+        
+        # Basic control for preceding vehicle (zero speed to keep it stationary)
+        agent = BasicAgent(preceding_vehicle_actor, target_speed=0)
+    
+        # Set destination for the preceding vehicle
+        current_location = preceding_vehicle_actor.get_location()
+        current_wp = carla_manager.map.get_waypoint(current_location, project_to_road=True)
+        next_wps = current_wp.next(100.0)  # 100 meters ahead
+    
+        if next_wps:  # if there is a waypoint ahead
+            destination = next_wps[0].transform.location
+        else:
+            destination = current_location
+        agent.set_destination(destination)
+    
+        # Spawn ego vehicle
+        spawn_loc_copy = SPAWN_LOCATION.copy()  # Make a copy to avoid modifying the original
+        spawn_loc_copy[0] += 20  # 20 meters behind preceding vehicle
+        ego_vehicle_actor = carla_manager.spawn_vehicle("vehicle.tesla.model3", spawn_loc_copy)
+        time.sleep(1)  # allow the vehicle to spawn
+        
+        # Wrap with Vehicle class
+        ego_vehicle = Vehicle(ego_vehicle_actor)
+    
+        # Create Frenet MPC controller with CasADi for ego vehicle
+        mpc_controller = FrenetMPCController(horizon=30, dt=0.1, carla_manager=carla_manager)
+    
+        # Target speed for ego vehicle (m/s)
+        target_speed = 20 / 3.6  # Convert from km/h to m/s
+    
+        # Main control loop
+        try:
+            print("Starting simulation with CasADi MPC. Press Ctrl+C to exit...")
+            while True:
+                # Get next waypoint for Frenet coordinates
+                current_location = ego_vehicle_actor.get_location()
+                next_waypoint = carla_manager.map.get_waypoint(current_location, project_to_road=True)
+                
+                # Control preceding vehicle (keep stationary)
+                control_cmd = agent.run_step()
+                preceding_vehicle_actor.apply_control(control_cmd)
+    
+                # Control ego vehicle with CasADi Frenet MPC
+                ego_control = mpc_controller.run_step(
+                    ego_vehicle, preceding_vehicle, target_speed, next_waypoint
+                )
+                ego_vehicle_actor.apply_control(ego_control)
+    
+                # Print current status
+                ego_frenet, _ = ego_vehicle.get_frenet_states(next_waypoint)
+                lead_frenet, _ = preceding_vehicle.get_frenet_states(next_waypoint)
+                
+                # Calculate real-world distance between vehicles
+                ego_loc = ego_vehicle_actor.get_location()
+                lead_loc = preceding_vehicle_actor.get_location()
+                distance = np.sqrt(
+                    (ego_loc.x - lead_loc.x) ** 2 + (ego_loc.y - lead_loc.y) ** 2
+                )
+                
+                # print(f"Distance to lead vehicle: {distance:.2f} m")
+                # print(f"Ego lateral deviation: {ego_frenet[1]:.2f} m")
+                # print(f"Ego heading error: {np.degrees(ego_frenet[2]):.2f} degrees")
+                # print(f"Optimization using CasADi solver")
+    
+                time.sleep(0.05)
+    
+        except KeyboardInterrupt:
+            print("\nSimulation terminated by user")
+    
+    except Exception as e:
+        print(f"Error during simulation: {e}")
+        import traceback
+        traceback.print_exc()
+        
+    finally:
+        # Clean up vehicles first (if they exist and are alive)
+        if preceding_vehicle_actor and preceding_vehicle_actor.is_alive:
+            try:
+                preceding_vehicle_actor.destroy()
+                print("Lead vehicle destroyed")
+            except Exception as e:
+                print(f"Error destroying lead vehicle: {e}")
+                
+        if ego_vehicle_actor and ego_vehicle_actor.is_alive:
+            try:
+                ego_vehicle_actor.destroy()
+                print("Ego vehicle destroyed")
+            except Exception as e:
+                print(f"Error destroying ego vehicle: {e}")
+        
+        # Reset the world after cleaning up specific vehicles
+        print("Resetting the Carla world...")
+        carla_manager.restart_world()
+        print("Reset complete. You can run the program again without restarting Carla.")
+
+if __name__ == "__main__":
+    run_simulation_with_casadi()
