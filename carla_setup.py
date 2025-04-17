@@ -14,7 +14,7 @@ SPAWN_LOCATION = [
 ]  # for spectator camera
 
 # synchronous_mode will make the simulation predictable
-synchronous_mode = True
+synchronous_mode = False
 
 
 class CarlaManager:
@@ -27,7 +27,7 @@ class CarlaManager:
 
     def __init__(self):
         self.client = carla.Client("localhost", 2000)
-        self.client.set_timeout(10.0)
+        self.client.set_timeout(60.0)
         self.client.load_world("Town04")
         self.world = self.client.get_world()
         self.map = self.world.get_map()
@@ -158,10 +158,15 @@ def generate_overtake_waypoints(carla_manager, vehicle, direction="left",
         last_wp = next_wp
 
     # 2. Change lane: get the adjacent lane from the last waypoint
+        # 45 degree line segment spacing
     if direction == "left":
         adjacent_wp = last_wp.get_left_lane()
+        # next_adjacent_wp = adjacent_wp.next(lane_change_step)
+        # next_adjacent_wp =next_adjacent_wp[0]
     else:
         adjacent_wp = last_wp.get_right_lane()
+        # next_adjacent_wp = adjacent_wp.next(lane_change_step)
+        # next_adjacent_wp =next_adjacent_wp[0]
 
     if adjacent_wp is None:
         print("No adjacent lane available in direction", direction)
@@ -169,6 +174,8 @@ def generate_overtake_waypoints(carla_manager, vehicle, direction="left",
 
     waypoints.append(adjacent_wp)
     last_wp = adjacent_wp
+    # waypoints.append(next_adjacent_wp)
+    # last_wp = next_adjacent_wp
 
     # 3. Follow adjacent lane for overtaking distance.
     traveled = 0.0
@@ -182,14 +189,22 @@ def generate_overtake_waypoints(carla_manager, vehicle, direction="left",
         last_wp = next_wp
 
     # 4. Merge back to the original lane.
+        # 45 degree line segment spaceing
     if direction == "left":
         merging_wp = last_wp.get_right_lane()
+        # next_merging_wp = merging_wp.next(lane_change_step)
+        # next_merging_wp = next_merging_wp[0]
     else:
         merging_wp = last_wp.get_left_lane()
+        # next_merging_wp = merging_wp.next(lane_change_step)
+        # next_merging_wp = next_merging_wp[0]
 
     if merging_wp is not None:
         waypoints.append(merging_wp)
         last_wp = merging_wp
+        # waypoints.append(next_merging_wp)
+        # last_wp = next_merging_wp
+        
         traveled = 0.0
         while traveled < merge_distance:
             next_wps = last_wp.next(lane_change_step)
@@ -222,6 +237,7 @@ def get_next_waypoint_from_list(waypoints, vehicle, current_index, threshold=2.0
     # advance to the next waypoint if available.
     if current_index < len(waypoints):
         wp = waypoints[current_index]
+        print(vehicle_loc.distance(wp.transform.location))
         if vehicle_loc.distance(wp.transform.location) < threshold and current_index < len(waypoints)-1:
             current_index += 1
     else:
@@ -235,6 +251,7 @@ if __name__ == "__main__":
     preceding_vehicle = carla_manager.spawn_vehicle("vehicle.tesla.model3", SPAWN_LOCATION)
     preceding_vehicle.set_autopilot(False)
     time.sleep(1)  # allow the vehicle to spawn
+    carla_manager.world.tick()
 
     # start autopilot controller for preciding vehicle
     agent = BasicAgent(preceding_vehicle, target_speed=10)
@@ -255,6 +272,7 @@ if __name__ == "__main__":
     SPAWN_LOCATION[0] += 10
     ego_vehicle = carla_manager.spawn_vehicle("vehicle.tesla.model3", SPAWN_LOCATION)
     time.sleep(1)  # allow the vehicle to spawn
+    carla_manager.world.tick()
 
     # TODO fix the waypoints for smooth lane change
     # generate overtaking waypoints
@@ -266,18 +284,34 @@ if __name__ == "__main__":
                                             merge_distance=10.0)
     # For debugging, you can visualize the waypoints:
     carla_manager.debug_waypoints(waypoints)
-    pid_controller = VehiclePIDController(ego_vehicle, {'K_P': 0.9}, {'K_P': 0.01, 'K_I': 0.0, 'K_D': 0.5})
+    pid_controller = VehiclePIDController(ego_vehicle, {'K_P': 6.0, 'K_I':0.5, 'K_D':0.2}, {'K_P': 0.01, 'K_I': 0.0, 'K_D': 0.5})
 
     current_wp_index = 0
     # main loop
-    while True:
-        control_cmd = agent.run_step()
-        preceding_vehicle.apply_control(control_cmd)
+    try:
+        while True:
+            control_cmd = agent.run_step()
+            preceding_vehicle.apply_control(control_cmd)
 
-        # PID controller for ego vehicle -- not working yet
-        next_overtake_wp, current_wp_index = get_next_waypoint_from_list(waypoints, ego_vehicle, current_wp_index, threshold=2.0)
-        ego_control = pid_controller.run_step(20, next_overtake_wp)  # target speed 30 km/h
-        ego_vehicle.apply_control(ego_control)
-        # print('Specator location:', carla_manager.spectator.get_transform().location, 'rotation:', carla_manager.spectator.get_transform().rotation)
-        carla_manager.world.tick()
-        # time.sleep(0.05)
+            # PID controller for ego vehicle -- not working yet
+            next_overtake_wp, current_wp_index = get_next_waypoint_from_list(waypoints, ego_vehicle, current_wp_index, threshold=2.0)
+            
+            ego_control = pid_controller.run_step(20, next_overtake_wp)  # target speed 30 km/h
+            ego_vehicle.apply_control(ego_control)
+            # print('Specator location:', carla_manager.spectator.get_transform().location, 'rotation:', carla_manager.spectator.get_transform().rotation)
+            carla_manager.world.tick()
+            time.sleep(0.05)
+
+            ## debug 
+            v1 = preceding_vehicle.get_velocity()
+            v2 = ego_vehicle.get_velocity()
+
+            speed1 = 3.6 * (v1.x**2 + v1.y**2 + v1.z**2)**0.5  # km/h
+            speed2 = 3.6 * (v2.x**2 + v2.y**2 + v2.z**2)**0.5
+            
+            print(f"[EGO CONTROL] throttle: {ego_control.throttle:.2f}, steer: {ego_control.steer:.2f}, brake: {ego_control.brake:.2f}")
+            print(f"Preceding speed: {speed1:.2f} km/h | Ego speed: {speed2:.2f} km/h")
+    except KeyboardInterrupt:
+        carla_manager.__del__()
+        print('Closing Carla')
+

@@ -3,7 +3,7 @@
     "configurations": [
       {
         "name": "Run Carla Script",
-        "type": "debugpy",
+        "type": "python",
         "request": "launch",
         "program": "${file}",
         "console": "integratedTerminal",
@@ -11,7 +11,7 @@
           "PYTHONPATH": "${workspaceFolder}:/home/akua/Desktop/CARLA/PythonAPI/carla/dist/carla-0.9.13-py3.7-linux-x86_64.egg"
         },
         "envFile": "${workspaceFolder}/.env",
-        "python": "${command:python.interpreterPath}"
+        "python": "/home/akua/miniconda3/envs/carla-env/bin/python"
       }
     ]
   }
