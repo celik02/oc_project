@@ -14,7 +14,7 @@ SPAWN_LOCATION = [
 ]  # for spectator camera
 
 # synchronous_mode will make the simulation predictable
-synchronous_mode = True
+synchronous_mode = False
 
 
 class CarlaManager:
@@ -255,7 +255,7 @@ if __name__ == "__main__":
     SPAWN_LOCATION[0] += 10
     ego_vehicle = carla_manager.spawn_vehicle("vehicle.tesla.model3", SPAWN_LOCATION)
     time.sleep(1)  # allow the vehicle to spawn
-
+    carla_manager.world.tick()  # tick the world to sync
     # TODO fix the waypoints for smooth lane change
     # generate overtaking waypoints
     waypoints = generate_overtake_waypoints(carla_manager, ego_vehicle,
@@ -279,5 +279,5 @@ if __name__ == "__main__":
         ego_control = pid_controller.run_step(20, next_overtake_wp)  # target speed 30 km/h
         ego_vehicle.apply_control(ego_control)
         # print('Specator location:', carla_manager.spectator.get_transform().location, 'rotation:', carla_manager.spectator.get_transform().rotation)
+        # time.sleep(0.5)
         carla_manager.world.tick()
-        # time.sleep(0.05)

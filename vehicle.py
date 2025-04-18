@@ -1,4 +1,4 @@
-# from ekf import CustomEKF
+from ekf_base import CustomEKF_NEW
 import numpy as np
 import threading
 import queue
@@ -8,8 +8,13 @@ from scipy.optimize import least_squares
 import carla
 import math
 import logging
+import time
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
+
+state_dim = 4  # State dimension
+measurement_dim = 2  # Measurement dimension
+control_dim = 2  # Control dimension
 
 
 class Vehicle:
@@ -17,25 +22,24 @@ class Vehicle:
     Vehicle class to represent a vehicle in the simulation.
     """
 
-    def __init__(self, actor, ekf=None):
+    def __init__(self, actor):
         """
         Initialize the vehicle with a Carla actor.
         :param actor: The Carla actor representing the vehicle.
         """
         self.actor = actor
-        self.ekf = ekf
+        self.ekf = None
         self.imu_data_queue = queue.Queue(maxsize=10)
         self.gps_data_queue = queue.Queue(maxsize=5)
         self.state_lock = threading.Lock()
         self.latest_state = np.zeros(5)  # Initialize latest state to zero, will be updated by EKF]
         self.wheel_base = 2.5  # Example wheel base, adjust as necessary  # FIXME
-        # TODO set initial state of EKF
-        # self.ekf.x = np.array([0, 0, 0, 0, 0])  # Example initial state
-        self.carla_coords = np.array([0.0, 0.0, 0.0])  # Placeholder for GPS coordinates
 
         # initialize states
+        self.carla_coords = None  # Placeholder for GPS coordinates
+        self.imu_data_array = None  # Placeholder for IMU data
         self.s = 0
-        self.prev_loc = self.actor.get_transform().location
+        self.prev_loc = self.actor.get_transform().location  # FIXME this may not be correct given the s values
 
     def attach_sensors(self, GPS=None, IMU=None):
         """
@@ -46,18 +50,51 @@ class Vehicle:
         self.gps = GPS
         self.imu = IMU
 
-        self.gps.listen(self.gps_callback) if GPS else None
-        self.imu.listen(self.imu_callback) if IMU else None
+        self.gps.listen(self._gps_callback) if GPS else None
+        self.imu.listen(self._imu_callback) if IMU else None
+        logger.debug("Sensors attached to vehicle GPS:%s IMU:%s", GPS, IMU)
 
-    def gps_callback(self, data):
+    def initialize_ekf(self, P0, Q, R):
+        """
+        Initialize the Extended Kalman Filter (EKF) with an initial state.
+        :param initial_state: The initial state to set for the EKF.
+        """
+        self.ekf = CustomEKF_NEW(dim_x=state_dim, dim_z=measurement_dim, dim_u=control_dim)
+        self.ekf.x = np.zeros(state_dim)  # Example initial state
+        self.ekf.P = P0  # Initial covariance
+        self.ekf.Q = Q  # Process noise covariance
+        self.ekf.R = R  # Measurement noise covariance
+        gps_data = None
+        while True:
+            try:
+                gps_data = self.gps_data_queue.get_nowait()
+            except queue.Empty:
+                gps_data = None
+                print("GPS queue empty")
+            if gps_data is not None:
+                print(f"GPS data received: {gps_data}")
+                self.ekf.x[0] = self.carla_coords[0]
+                self.ekf.x[1] = self.carla_coords[1]
+                logger.debug("EKF initialized with GPS data %s", self.ekf.x)
+
+                break
+            else:
+                time.sleep(0.05)
+                logger.debug("Waiting for GPS data to initialize EKF")
+
+        yaw = self.actor.get_transform().rotation.yaw
+        self.ekf.x[2] = np.radians(yaw) % (2 * np.pi)
+
+    def _gps_callback(self, data):
         """
         Callback function for GPS data.
         :param data: The GPS data received from the sensor.
         """
-        print("Received GPS data callback")  # Debug statement to confirm callback is called
+        logger.debug("Received GPS data callback")  # Debug statement to confirm callback is called
         self.gps_data = data
+        print('data timestamp', self.gps_data.timestamp)
         self.gps_arr = copy.copy(np.array([self.gps_data.latitude, self.gps_data.longitude, self.gps_data.altitude]))
-        (carla_x, carla_y, carla_z) = self.convert_gps_to_carla(self.gps_arr)
+        (carla_x, carla_y, carla_z) = self._convert_gps_to_carla(self.gps_arr)
         self.carla_coords = (carla_x, carla_y, carla_z)
         try:
             self.gps_data_queue.put_nowait(copy.deepcopy(self.carla_coords))
@@ -67,7 +104,7 @@ class Vehicle:
 
         # print('Vehicle actual position:', self.actor.get_transform().location)
 
-    def convert_gps_to_carla(self, gps):
+    def _convert_gps_to_carla(self, gps):
         """
         Converts GPS signal into the CARLA coordinate frame
         :param gps: gps from gnss sensor
@@ -81,7 +118,7 @@ class Vehicle:
         gps = np.array([gps[1], -gps[0], gps[2]])
         return gps
 
-    def imu_callback(self, data):
+    def _imu_callback(self, data):
         """
         Callback function for IMU data.
         :param data: The IMU data received from the sensor.
@@ -91,6 +128,7 @@ class Vehicle:
         self.imu_data = data
         self.imu_data_array = np.array([-self.imu_data.accelerometer.x, self.imu_data.accelerometer.y, self.imu_data.accelerometer.z,
                                         self.imu_data.gyroscope.x, self.imu_data.gyroscope.y, self.imu_data.gyroscope.z])
+        logger.debug("Received IMU data callback %s ", self.imu_data_array)
         # print(f"IMU data received: {self.imu_data_array}")
         try:
             self.imu_data_queue.put_nowait(copy.deepcopy(self.imu_data_array))
@@ -103,6 +141,16 @@ class Vehicle:
         Apply control to the vehicle.
         :param control: The control to apply (e.g., throttle, brake, steer).
         """
+        self.actor.apply_control(control)
+
+    def apply_control_accel(self, accel, steer):
+        """
+        Apply control to the vehicle.
+        :param throttle: The throttle value to apply.
+        :param steer: The steering value to apply.
+        """
+        throttle, brake = throttle_brake_mapping1(accel)
+        control = carla.VehicleControl(throttle=throttle, brake=brake, steer=steer)
         self.actor.apply_control(control)
 
     def update_ekf(self):
@@ -121,22 +169,23 @@ class Vehicle:
         #     print('ERROR', e)
         #     traceback.print_exc()
 
-        # try:
-        #     gps_data = self.gps_data_queue.get_nowait()
-        #     z = np.array([gps_data[0], gps_data[1]])
-        #     self.ekf.update(z)
-        #     print(f"Updating EKF with GPS data: {gps_data}")
-        # except queue.Empty:
-        #     print("No GPS data available for EKF update.")
-        #     gps_data = None
-        # except Exception as e:
-        #     print('ERROR', e)
-        #     traceback.print_exc()
+        try:
+            gps_data = self.gps_data_queue.get_nowait()
+            z = np.array([gps_data[0], gps_data[1]])
+            self.ekf.update(z)
+            logger.debug(f"Updating EKF with GPS data: {gps_data}")
+        except queue.Empty:
+            logger.debug("No GPS data available for EKF update.")
+            gps_data = None
+        except Exception as e:
+            logger.error('%s', e)
+            traceback.print_exc()
 
         with self.state_lock:
             self.latest_state = self.ekf.x.copy()
 
     def get_latest_state(self):
+        ''' returns the latest state of the vehicle from the EKF'''
         with self.state_lock:
             return self.latest_state
 
@@ -144,6 +193,12 @@ class Vehicle:
         """
         Get the Frenet states of the vehicle.
         :return: The Frenet coordinates as a numpy array [s, d, mu, speed, steering_angle, curvature]
+        s: Progress along the lane.
+        d: Deviation from the lane center.
+        mu: Heading error.
+        speed: Speed of the vehicle.
+        steering_angle: Steering angle of the vehicle.
+        curvature: Curvature of the path. [not IMPLEMENTED since we are going straight]
         """
         velocity = self.actor.get_velocity()
         speed = np.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)  # speed in m/s
@@ -187,14 +242,14 @@ class Vehicle:
             + np.pi
         ) % (2 * np.pi) - np.pi
 
-        self.s += self.calculate_progress()
+        self.s += self._calculate_progress()
 
-        d = self.calculate_deviation(self.waypoint)
+        d = self._calculate_deviation(self.waypoint)
         state_data = np.array([self.s, d, mu, speed, steering_angle, curvature])
 
         return state_data, self.waypoint
 
-    def calculate_deviation(self, waypoint):
+    def _calculate_deviation(self, waypoint):
         """
         Calculate the signed deviation of the vehicle from the center of the lane.
         """
@@ -236,7 +291,7 @@ class Vehicle:
 
         return cross_product_z
 
-    def calculate_progress(self):
+    def _calculate_progress(self):
         """
         Calculate the progress 's' along the lane for a CARLA vehicle.
         Returns:
@@ -250,7 +305,18 @@ class Vehicle:
         return s
 
 
-# if we need curvature we will need this function
+def throttle_brake_mapping1(a):
+    if a >= 0:
+        throttle = a / 4
+        brake = 0
+    else:
+        throttle = 0
+        brake = a / 6
+
+    return throttle, brake
+
+
+# if we need curvature, we will need this function
 def fit_circle(path_to_follow_waypoints, next_waypoint):
     # Initial guess for parameters: center at mean of points, radius as half of maximum distance from center
     x_centerline = []

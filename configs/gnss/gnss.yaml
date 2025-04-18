@@ -1,8 +1,8 @@
 blueprint: sensor.other.gnss
 sensor_tick: 0.1
 noise_seed: 0
-noise_lat_stddev: 0.000001  # Standard deviation of noise in the latitude direction (degrees)
-noise_lon_stddev: 0.000001  # Standard deviation of noise in the longitude direction (degrees)
+noise_lat_stddev: 0.00001  # Standard deviation of noise in the latitude direction (degrees)
+noise_lon_stddev: 0.00001  # Standard deviation of noise in the longitude direction (degrees)
 location:  # mount position
   x: 0
   y: 0
