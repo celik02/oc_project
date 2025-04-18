@@ -10,7 +10,7 @@ import math
 import logging
 import time
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.WARNING)
 
 state_dim = 4  # State dimension
 measurement_dim = 2  # Measurement dimension
@@ -206,7 +206,7 @@ class Vehicle:
         # Get vehicle control (steering)
         control = self.actor.get_control()
         steering_angle = np.clip(control.steer, -1, 1)
-        max_steering_angle = np.radians(69.99999237060547) 
+        max_steering_angle = np.radians(69.99999237060547)
         steering_angle = steering_angle * max_steering_angle
 
         # calculate heading error

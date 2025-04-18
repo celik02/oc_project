@@ -14,7 +14,7 @@ SPAWN_LOCATION = [
 ]  # for spectator camera
 
 # synchronous_mode will make the simulation predictable
-synchronous_mode = False
+synchronous_mode = True
 
 
 class CarlaManager:
