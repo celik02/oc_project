@@ -82,8 +82,8 @@ class FrenetMPCController:
         self.w_progress = 5.0    # Forward progress reward
         self.w_lane = 3.0        # Lane centering reward
         self.w_speed = 0.0       # Target speed reward
-        self.w_accel = 0.03       # Acceleration minimization
-        self.w_steer = 0.03       # Steering minimization
+        self.w_accel = 0.0       # Acceleration minimization
+        self.w_steer_rate = 0.0  # Steering rate minimization
         self.w_jerk = 0.0        # Jerk minimization
 
         # Lane chang    e parameters
@@ -120,11 +120,13 @@ class FrenetMPCController:
 
         print(f"d = {d0:.2f}")
 
-
         # Get Frenet states for preceding vehicle using the same waypoint reference
         lead_frenet, _ = preceding_vehicle.get_frenet_states(next_waypoint)
         lead_s, lead_d, _, lead_speed, _, _ = lead_frenet
 
+        # Print diagnostic information about the Frenet coordinates
+        # print(f"Ego Frenet: s={s0:.2f}, d={d0:.2f}, v={v0:.2f}")
+        # print(f"Lead Frenet: s={lead_s:.2f}, d={lead_d:.2f}, v={lead_speed:.2f}")
 
         # Calculate relative distance in world coordinates
         ego_location = ego_vehicle.actor.get_location()
@@ -193,8 +195,7 @@ class FrenetMPCController:
         d_desired = ca.SX.sym('d_desired', 1)
 
         # Define the dynamics function with adapted model
-        dynamics_func = ca.Function('dynamics', [x, u],
-                                [frenet_vehicle_dynamics_casadi(x, u, self.dt)])
+        dynamics_func = ca.Function('dynamics', [x, u], [frenet_vehicle_dynamics_casadi(x, u, self.dt)])
 
         # Initialize the cost function and constraints
         obj = 0
@@ -225,7 +226,7 @@ class FrenetMPCController:
             # In the for k in range(self.horizon) loop:
 
             # 1. Progress reward (using distance along the lane)
-            obj -= self.w_progress * xk[0]  # Forward progress reward
+            obj -= self.w_progress * xk[0]  # Forward progress reward - bigger s is better
 
             # 2. Lane centering
             obj += self.w_lane * (xk[1] - d_desired)**2
@@ -235,7 +236,7 @@ class FrenetMPCController:
 
             # 4. Control effort - now penalizing acceleration and steering rate
             obj += self.w_accel * uk[0]**2  # Acceleration
-            obj += self.w_steer * uk[1]**2  # Steering angle
+            # obj += self.w_steer * uk[1]**2  # Steering angle
             # # penalize steering rate
             # obj += self.w_steer * (uk[1] - xk[4])**2  # Steering rate
 
@@ -243,7 +244,7 @@ class FrenetMPCController:
             if k > 0:
                 prev_uk = opt_vars[-3]  # Two items back in the list
                 obj += self.w_jerk * ((uk[0] - prev_uk[0]) / self.dt)**2  # Jerk penalty (accel rate)
-
+                obj += self.w_steer_rate * ((uk[1] - prev_uk[1]) / self.dt)**2  # Jerk penalty (accel rate)
 
             # Lead vehicle position at this step
             lead_s_k = lead_s_pred[k]
@@ -587,6 +588,7 @@ def run_simulation_with_casadi():
 
     # Create CarlaManager instance
     carla_manager = CarlaManager()
+    # carla_manager.restart_world()  # Ensure the world is clean before starting
     print("CarlaManager is created")
 
     preceding_vehicle_actor = None
@@ -631,7 +633,7 @@ def run_simulation_with_casadi():
         ego_vehicle = Vehicle(ego_vehicle_actor)
 
         # Create Frenet MPC controller with CasADi for ego vehicle
-        mpc_controller = FrenetMPCController(horizon=30, dt=dt, carla_manager=carla_manager)
+        mpc_controller = FrenetMPCController(horizon=100, dt=dt, carla_manager=carla_manager)
 
         # Target speed for ego vehicle (m/s)
         target_speed = 15 / 3.6  # Convert from km/h to m/s
@@ -729,6 +731,7 @@ def run_simulation_with_casadi():
 
         # Reset the world after cleaning up specific vehicles
         print("Resetting the Carla world...")
+        # carla_manager.restart_world()
         if synchronous_mode:
             settings = carla_manager.world.get_settings()
             settings.synchronous_mode = False
