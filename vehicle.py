@@ -206,6 +206,8 @@ class Vehicle:
         # Get vehicle control (steering)
         control = self.actor.get_control()
         steering_angle = np.clip(control.steer, -1, 1)
+        max_steering_angle = np.radians(69.99999237060547) 
+        steering_angle = steering_angle * max_steering_angle
 
         # calculate heading error
         self.waypoint = next_waypoint
