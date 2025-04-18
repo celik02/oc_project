@@ -82,8 +82,8 @@ class FrenetMPCController:
         self.w_progress = 5.0    # Forward progress reward
         self.w_lane = 3.0        # Lane centering reward
         self.w_speed = 0.0       # Target speed reward
-        self.w_accel = 0.0       # Acceleration minimization
-        self.w_steer = 0.0       # Steering minimization
+        self.w_accel = 0.03       # Acceleration minimization
+        self.w_steer = 0.03       # Steering minimization
         self.w_jerk = 0.0        # Jerk minimization
 
         # Lane chang    e parameters
@@ -125,9 +125,6 @@ class FrenetMPCController:
         lead_frenet, _ = preceding_vehicle.get_frenet_states(next_waypoint)
         lead_s, lead_d, _, lead_speed, _, _ = lead_frenet
 
-        # Print diagnostic information about the Frenet coordinates
-        # print(f"Ego Frenet: s={s0:.2f}, d={d0:.2f}, v={v0:.2f}")
-        # print(f"Lead Frenet: s={lead_s:.2f}, d={lead_d:.2f}, v={lead_speed:.2f}")
 
         # Calculate relative distance in world coordinates
         ego_location = ego_vehicle.actor.get_location()
@@ -590,7 +587,6 @@ def run_simulation_with_casadi():
 
     # Create CarlaManager instance
     carla_manager = CarlaManager()
-    carla_manager.restart_world()  # Ensure the world is clean before starting
     print("CarlaManager is created")
 
     preceding_vehicle_actor = None
@@ -733,7 +729,6 @@ def run_simulation_with_casadi():
 
         # Reset the world after cleaning up specific vehicles
         print("Resetting the Carla world...")
-        # carla_manager.restart_world()
         if synchronous_mode:
             settings = carla_manager.world.get_settings()
             settings.synchronous_mode = False
