@@ -142,6 +142,11 @@ class CarlaManager:
                 persistent_lines=True,
             )
 
+def wrap_to_pi(angle):
+    """
+    Convert any radius to (-pi, pi)
+    """
+    return (angle + np.pi) % (2 * np.pi) - np.pi
 
 def vehicle_linear_dynamics(x0, u0, L=3.0, Tau=1.0):
     """
@@ -464,13 +469,13 @@ def get_current_state(vehicle):
 
     return state_vec
 
-def LQR_Controller(x_cur, next_location, desired_vel = 30.0):
+def LQR_Controller(x_cur, next_location, last_u, desired_vel = 30.0):
     """
     Parameters:
         x_cur: np.array([x, y, psi, v, a]) - vehicle current state
         next_location: np.array([x, y, z]) - next target location
+        last_u: p.array([delta, u_a]) - last control command
         desired_vel: float - desired velocity in km/h
-        dt: simulation time step size
 
     Returns:
         u_next: np.array([delta, u_a]) - next control command
@@ -498,8 +503,8 @@ def LQR_Controller(x_cur, next_location, desired_vel = 30.0):
     A, B = vehicle_linear_dynamics(x0, u0)
 
     # ===== 2. Solve Continuous Algebraic Riccati Equation (CARE) =====
-    Q = np.diag([10, 10, 30, 10, 5])   # weight on state errors
-    R = np.diag([1, 1])              # weight on control effort
+    Q = np.diag([10, 6, 8, 10, 5])   # weight on state errors
+    R = np.diag([2, 1])              # weight on control effort
 
     # Solve CARE: A'P + PA - PBR⁻¹B'P + Q = 0
     P = solve_continuous_are(A, B, Q, R)
@@ -509,8 +514,11 @@ def LQR_Controller(x_cur, next_location, desired_vel = 30.0):
 
     # ===== 3. Feedback control =====
     x_hat = x_cur - x0       # state deviation
+    x_hat[2] = wrap_to_pi(x_hat[2])     # make sure the angle difference is within (-pi ,pi)
     u_hat = -K @ x_hat       # control deviation from nominal
     u_next = u0 + u_hat      # actual control input
+    # u_next[0] = 0.5 * last_u[0] + 0.5 * u_next[0]
+
 
     # ===== 4. Update state =====
     dxdt = nonlinear_dynamics(x_cur, u_next)
@@ -568,7 +576,7 @@ if __name__ == "__main__":
     # set destination for the preceding vehicle
     current_location = preceding_vehicle.get_location()
     current_wp = carla_manager.map.get_waypoint(current_location, project_to_road=True)
-    next_wps = current_wp.next(100.0)  # 100 meters ahead
+    next_wps = current_wp.next(130.0)  
     if next_wps:  # if there is a waypoint ahead
         destination = next_wps[0].transform.location
     else:
@@ -579,7 +587,6 @@ if __name__ == "__main__":
     ego_vehicle = carla_manager.spawn_vehicle("vehicle.tesla.model3", SPAWN_LOCATION)
     time.sleep(1)  # allow the vehicle to spawn
     carla_manager.world.tick()
-    # TODO fix the waypoints for smooth lane change
     # generate overtaking waypoints
     waypoints, location_points = generate_overtake_waypoints(carla_manager, ego_vehicle,
                                             direction="left",
@@ -592,6 +599,7 @@ if __name__ == "__main__":
     carla_manager.debug_np_locations(location_points)
 
     current_wp_index = 0
+    u_next = np.zeros(2)
 
     try:
         # main loop:
@@ -607,7 +615,7 @@ if __name__ == "__main__":
             # Get current state
             x_cur = get_current_state(ego_vehicle)
             # Get control w.r.t. next_wp and current state
-            u_next, x_next, x0 = LQR_Controller(x_cur, next_overtake_location, 20)     # desired velocity as 20 km/h
+            u_next, x_next, x0 = LQR_Controller(x_cur, next_overtake_location, u_next, 20)     # desired velocity as 20 km/h
 
             control = convert2Carla(u_next)
             ego_vehicle.apply_control(control)
