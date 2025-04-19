@@ -6,9 +6,14 @@ from agents.navigation.global_route_planner import GlobalRoutePlanner  # type: i
 from agents.navigation.basic_agent import BasicAgent
 from vehicle import Vehicle  # Import the Vehicle class
 from carla_setup import get_next_waypoint_from_list
-
+import traceback
 import casadi as ca
-
+import logging
+import sys
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+FORMAT = "[%(asctime)s.%(msecs)03d %(filename)15s:%(lineno)3s - %(funcName)17s() ] %(levelname)s %(message)s"
+logging.basicConfig(level=logging.DEBUG, stream=sys.stdout, force=True, format=FORMAT, datefmt='%H:%M:%S')
 dt = 0.05  # seconds
 SPAWN_LOCATION = [
     111.229362,
@@ -79,15 +84,15 @@ class FrenetMPCController:
         self.min_steer = -np.pi / 4  # Min steering allowed (rad)
 
         # Cost function weights
-        self.w_progress = 5.0    # Forward progress reward
-        self.w_lane = 3.0        # Lane centering reward
+        self.w_progress = 20.0    # Forward progress reward
+        self.w_lane = 0.0        # Lane centering reward
         self.w_speed = 0.0       # Target speed reward
         self.w_accel = 0.0       # Acceleration minimization
         self.w_steer_rate = 0.0  # Steering rate minimization
         self.w_jerk = 0.0        # Jerk minimization
 
         # Lane chang    e parameters
-        self.lane_width = 3.5    # Standard lane width in meters
+        self.lane_width = 1.75    # Standard lane width in meters
         self.current_lane = 0    # Middle lane (0), left lane (-1), right lane (1)
         self.target_lane = 0     # Initially target the current lane
 
@@ -249,15 +254,16 @@ class FrenetMPCController:
             # Lead vehicle position at this step
             lead_s_k = lead_s_pred[k]
             lead_d_k = lead_d_pred[k]
-
+            logger.debug(f"Lead vehicle position at step {k}: s={lead_s_k}, d={lead_d_k}")
             # Collision avoidance constraint (ellipsoid)
             # Define ellipsoid parameters
             a = 6.0  # Longitudinal semi-axis (front-back)
-            b = 3.0  # Lateral semi-axis (side-to-side)
+            b = 2.5  # Lateral semi-axis (side-to-side)
 
             # Calculate distances in Frenet coordinates
-            ds = (lead_s_k) - xk[0]  # Longitudinal distance
-            dd = lead_d_k - xk[1]  # Lateral distance
+            ds = (20) - xk[0]  # Longitudinal distance
+            dd = 0 - xk[1]  # Lateral distance
+            logger.debug(f"Lead vehicle distance at step {k}: ds={ds}, dd={dd}")
 
             # Add collision avoidance constraint
             # We want (ds/a)² + (dd/b)² >= 1 (outside the ellipsoid)
@@ -290,8 +296,27 @@ class FrenetMPCController:
 
                 # Add the dynamics constraint: next state must equal dynamics model
                 g.append(xk_next_sym - xk_next)
-                lbg.extend([0, 0, 0, 0])  # Equality constraints for 6D state
+                lbg.extend([0, 0, 0, 0])  # Equality constraints for 4D state
                 ubg.extend([0, 0, 0, 0])
+
+                # Lane constraint with slack variable
+                slack_lane = ca.SX.sym(f'slack_lane_{k}', 1)
+                opt_vars.append(slack_lane)
+
+                # Slack variable should be non-negative but can be large if needed
+                opt_vars_lb.extend([0])
+                opt_vars_ub.extend([5])  # Upper bound can be tuned
+                g.append(xk_next_sym[1] - d_desired + slack_lane)  # Lower bound slack
+                lbg.append(-self.lane_width)  # Lower bound is -lane_width
+                ubg.append(self.lane_width)  # Upper bound is 0
+
+                # # Right lane boundary is strict (no slack)
+                # g.append(xk_next_sym[1] - d_desired)  # No slack for right lane
+                # lbg.append(-ca.inf)
+                # ubg.append(self.lane_width)
+
+                slack_weight = 10.0  # Tunable parameter
+                obj += slack_weight * slack_lane**2
 
                 # Update state for next iteration
                 xk = xk_next_sym
@@ -313,7 +338,7 @@ class FrenetMPCController:
                 'print_level': 0,         # 0 for no output
                 'max_iter': 10000,          # Maximum number of iterations
                 'acceptable_tol': 1e-4,   # Tolerance
-                'warm_start_init_point': 'yes'  # Use warm starting
+                'warm_start_init_point': 'yes',  # Use warm starting
             },
             'print_time': False
         }
@@ -349,7 +374,7 @@ class FrenetMPCController:
             # Extract lead vehicle prediction data
             lead_s_pred = np.array([pred[0] for pred in lead_vehicle_pred])
             lead_d_pred = np.array([pred[1] for pred in lead_vehicle_pred])
-
+            # print(f"Lead vehicle predictions: {lead_s_pred}, {lead_d_pred}")
             # Define initial guess (all zeros)
             x_init = np.zeros(self.opt_vars_size)
 
@@ -377,6 +402,10 @@ class FrenetMPCController:
                     lbx.extend([-np.inf, -np.inf, -np.inf, 0])
                     ubx.extend([np.inf, np.inf, np.inf, 40])
 
+                    # for slack variables
+                    lbx.extend([0])  # Non-negative slack
+                    ubx.extend([10])  # Upper bound for slack
+
             # Solve the optimization problem with stored constraint bounds
             sol = self.solver(
                 x0=x_init,
@@ -387,8 +416,26 @@ class FrenetMPCController:
                 p=p
             )
 
+            stats = self.solver.stats()
+            if stats['return_status'] in ['Infeasible_Problem_Detected', 'Maximum_CpuTime_Exceeded',
+                                      'Maximum_Iterations_Exceeded', 'Restoration_Failed']:
+                print(f"MPC problem is INFEASIBLE! Status: {stats['return_status']}")
+                print(f"Iteration count: {stats['iter_count']}")
+
             # Extract the optimal control sequence
             x_opt = sol['x'].full().flatten()
+
+            slack_values = []
+            for i in range(self.horizon-1):  # Only horizon-1 slack variables
+                # Calculate index for slack variable
+                # Each timestep has: 2 controls + 4 states + 1 slack (except last timestep)
+                state_control_size = self.num_controls + self.num_states
+                slack_idx = i * state_control_size + self.num_controls + self.num_states
+                slack_value = x_opt[slack_idx]
+                slack_values.append(slack_value)
+                print(f"Slack variable at step {i}: {slack_value:.4f}")
+
+            # input('Press Enter to continue...')
 
             # Reshape to get control sequence - adjusted for the 6+2 dimensionality
             u_optimal = []
@@ -401,6 +448,7 @@ class FrenetMPCController:
 
         except Exception as e:
             print(f"CasADi optimization failed: {e}")
+            traceback.print_exc()
 
     def get_lead_vehicle_prediction(self, lead_s, lead_d, lead_speed):
         """
@@ -414,6 +462,7 @@ class FrenetMPCController:
             # Assume constant velocity in s direction, constant d position
             s_lead = s_lead + lead_speed * self.dt
             predictions.append((s_lead, d_lead))
+            logger.debug(f"Lead vehicle prediction at step {i}: s={s_lead}, d={d_lead}")
 
         return predictions
 
@@ -612,7 +661,7 @@ def run_simulation_with_casadi():
         # Set destination for the preceding vehicle
         current_location = preceding_vehicle_actor.get_location()
         current_wp = carla_manager.map.get_waypoint(current_location, project_to_road=True)
-        next_wps = current_wp.next(100.0)  # 100 meters ahead
+        next_wps = current_wp.next(30.0)  # 100 meters ahead
 
         if next_wps:  # if there is a waypoint ahead
             destination = next_wps[0].transform.location
@@ -633,7 +682,7 @@ def run_simulation_with_casadi():
         ego_vehicle = Vehicle(ego_vehicle_actor)
 
         # Create Frenet MPC controller with CasADi for ego vehicle
-        mpc_controller = FrenetMPCController(horizon=100, dt=dt, carla_manager=carla_manager)
+        mpc_controller = FrenetMPCController(horizon=50, dt=dt, carla_manager=carla_manager)
 
         # Target speed for ego vehicle (m/s)
         target_speed = 15 / 3.6  # Convert from km/h to m/s
@@ -662,7 +711,7 @@ def run_simulation_with_casadi():
 
             while True:
                 # Get next waypoint for Frenet coordinates
-                next_waypoint, current_wp_index = get_next_waypoint_from_list(list_of_waypoints, ego_vehicle_actor, current_wp_index, threshold=2.0)
+                next_waypoint, current_wp_index = get_next_waypoint_from_list(list_of_waypoints, ego_vehicle_actor, current_wp_index, threshold=5.0)
 
                 # # Get next waypoint for Frenet coordinates
                 # current_location = ego_vehicle_actor.get_location()
