@@ -353,9 +353,9 @@ class FrenetMPCController:
             # Define initial guess (all zeros)
             x_init = np.zeros(self.opt_vars_size)
 
-            # Pack parameters with 6D state
+            # Pack parameters with state
             p = np.concatenate([
-                x0.flatten(),  # Now 6D
+                x0.flatten(), # Initial state [s, d, mu, v]
                 lead_s_pred.flatten(),
                 lead_d_pred.flatten(),
                 [target_speed],
