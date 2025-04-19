@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 FORMAT = "[%(asctime)s.%(msecs)03d %(filename)15s:%(lineno)3s - %(funcName)17s() ] %(levelname)s %(message)s"
 logging.basicConfig(level=logging.DEBUG, stream=sys.stdout, force=True, format=FORMAT, datefmt='%H:%M:%S')
-dt = 0.05  # seconds
+dt = 0.1  # seconds
 SPAWN_LOCATION = [
     111.229362,
     13.511219,
@@ -35,6 +35,8 @@ def frenet_vehicle_dynamics_casadi(x, u, dt):
     # Vehicle parameters
     lr = 1.5    # Distance from CG to rear axle
     lf = 1.375  # Distance from CG to front axle
+    # lr = 2.3
+    # lf = 2.4
     L = lr + lf  # Wheelbase
 
     # Extract states
@@ -52,7 +54,12 @@ def frenet_vehicle_dynamics_casadi(x, u, dt):
     beta = ca.arctan(lr/L * ca.tan(delta))
 
     # Curvature - set to 0 for straight road
-    kappa = 0.0
+    # try:
+    #     kappa = 1 / delta
+    # except FloatingPointError as e:
+    #     kappa = 0
+    #     print(e)
+    kappa = 0
 
     # Compute dynamics based on equation (29) but with direct controls
     s_dot = v * ca.cos(mu + beta) / (1 - d * kappa)
@@ -84,7 +91,7 @@ class FrenetMPCController:
         self.min_steer = -np.pi / 4  # Min steering allowed (rad)
 
         # Cost function weights
-        self.w_progress = 20.0    # Forward progress reward
+        self.w_progress = 30.0    # Forward progress reward
         self.w_lane = 0.0        # Lane centering reward
         self.w_speed = 0.0       # Target speed reward
         self.w_accel = 0.0       # Acceleration minimization
@@ -231,7 +238,7 @@ class FrenetMPCController:
             # In the for k in range(self.horizon) loop:
 
             # 1. Progress reward (using distance along the lane)
-            obj -= self.w_progress * xk[0]  # Forward progress reward - bigger s is better
+            obj += self.w_progress * (xk[0]-30)**2  # Forward progress reward - bigger s is better
 
             # 2. Lane centering
             obj += self.w_lane * (xk[1] - d_desired)**2
@@ -261,7 +268,7 @@ class FrenetMPCController:
             b = 2.5  # Lateral semi-axis (side-to-side)
 
             # Calculate distances in Frenet coordinates
-            ds = (20) - xk[0]  # Longitudinal distance
+            ds = (23) - xk[0]  # Longitudinal distance
             dd = 0 - xk[1]  # Lateral distance
             logger.debug(f"Lead vehicle distance at step {k}: ds={ds}, dd={dd}")
 
@@ -307,15 +314,15 @@ class FrenetMPCController:
                 opt_vars_lb.extend([0])
                 opt_vars_ub.extend([5])  # Upper bound can be tuned
                 g.append(xk_next_sym[1] - d_desired + slack_lane)  # Lower bound slack
-                lbg.append(-self.lane_width)  # Lower bound is -lane_width
-                ubg.append(self.lane_width)  # Upper bound is 0
+                lbg.append(-self.lane_width + 1.2)  # Lower bound is -lane_width
+                ubg.append(ca.inf)  # Upper bound is 0
 
-                # # Right lane boundary is strict (no slack)
-                # g.append(xk_next_sym[1] - d_desired)  # No slack for right lane
-                # lbg.append(-ca.inf)
-                # ubg.append(self.lane_width)
+                # Right lane boundary is strict (no slack)
+                g.append(xk_next_sym[1] - d_desired)  # No slack for right lane
+                lbg.append(-ca.inf)
+                ubg.append(self.lane_width - 1.2)
 
-                slack_weight = 10.0  # Tunable parameter
+                slack_weight = 280.0  # Tunable parameter
                 obj += slack_weight * slack_lane**2
 
                 # Update state for next iteration
@@ -427,10 +434,13 @@ class FrenetMPCController:
 
             slack_values = []
             for i in range(self.horizon-1):  # Only horizon-1 slack variables
-                # Calculate index for slack variable
-                # Each timestep has: 2 controls + 4 states + 1 slack (except last timestep)
-                state_control_size = self.num_controls + self.num_states
-                slack_idx = i * state_control_size + self.num_controls + self.num_states
+                # Each timestep has controls + states + slack (except last)
+                variables_per_timestep = self.num_controls + self.num_states + 1
+
+                # First get to the right timestep, then skip controls and states
+                slack_idx = i * variables_per_timestep + self.num_controls + self.num_states
+
+                # Now you're at the slack variable
                 slack_value = x_opt[slack_idx]
                 slack_values.append(slack_value)
                 print(f"Slack variable at step {i}: {slack_value:.4f}")
@@ -682,7 +692,7 @@ def run_simulation_with_casadi():
         ego_vehicle = Vehicle(ego_vehicle_actor)
 
         # Create Frenet MPC controller with CasADi for ego vehicle
-        mpc_controller = FrenetMPCController(horizon=50, dt=dt, carla_manager=carla_manager)
+        mpc_controller = FrenetMPCController(horizon=30, dt=dt, carla_manager=carla_manager)
 
         # Target speed for ego vehicle (m/s)
         target_speed = 15 / 3.6  # Convert from km/h to m/s
