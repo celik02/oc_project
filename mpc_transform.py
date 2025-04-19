@@ -11,7 +11,7 @@ import casadi as ca
 import logging
 import sys
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.WARNING)
 FORMAT = "[%(asctime)s.%(msecs)03d %(filename)15s:%(lineno)3s - %(funcName)17s() ] %(levelname)s %(message)s"
 logging.basicConfig(level=logging.DEBUG, stream=sys.stdout, force=True, format=FORMAT, datefmt='%H:%M:%S')
 dt = 0.1  # seconds
@@ -130,7 +130,7 @@ class FrenetMPCController:
         # Then update x0 with the stabilized heading
         x0 = np.array([s0, d0, mu0, v0])
 
-        print(f"d = {d0:.2f}")
+        # print(f"d = {d0:.2f}")
 
         # Get Frenet states for preceding vehicle using the same waypoint reference
         lead_frenet, _ = preceding_vehicle.get_frenet_states(next_waypoint)
@@ -443,7 +443,7 @@ class FrenetMPCController:
                 # Now you're at the slack variable
                 slack_value = x_opt[slack_idx]
                 slack_values.append(slack_value)
-                print(f"Slack variable at step {i}: {slack_value:.4f}")
+                # print(f"Slack variable at step {i}: {slack_value:.4f}")
 
             # input('Press Enter to continue...')
 
@@ -683,6 +683,7 @@ def run_simulation_with_casadi():
         spawn_loc_copy = SPAWN_LOCATION.copy()  # Make a copy to avoid modifying the original
         spawn_loc_copy[0] += 20  # 20 meters behind preceding vehicle
         ego_vehicle_actor = carla_manager.spawn_vehicle("vehicle.tesla.model3", spawn_loc_copy)
+
         if synchronous_mode:
             carla_manager.world.tick()  # Synchronize the world to ensure the vehicle is spawned
         else:
@@ -690,6 +691,15 @@ def run_simulation_with_casadi():
 
         # Wrap with Vehicle class
         ego_vehicle = Vehicle(ego_vehicle_actor)
+
+        # Capture spawn transform for ego vehicle
+        ego_vehicle.transform_to_spawn = ego_vehicle_actor.get_transform()
+        world_to_ego, ego_to_world = ego_vehicle.get_transform_matrices()
+
+        # Example: Get preceding vehicle's position in ego coordinates
+        lead_location = preceding_vehicle_actor.get_location()
+        lead_pos_in_ego = ego_vehicle.world_to_ego_coordinates(lead_location)
+        print(f"Lead vehicle position in ego coordinates: {lead_pos_in_ego}")
 
         # Create Frenet MPC controller with CasADi for ego vehicle
         mpc_controller = FrenetMPCController(horizon=30, dt=dt, carla_manager=carla_manager)
@@ -702,6 +712,12 @@ def run_simulation_with_casadi():
             current_wp_index = 0
             current_location = ego_vehicle_actor.get_location()
             next_waypoint = carla_manager.map.get_waypoint(current_location, project_to_road=True)
+
+            # Example: Get a waypoint in ego coordinates
+            waypoint_location = next_waypoint.transform.location
+            waypoint_in_ego = ego_vehicle.world_to_ego_coordinates(waypoint_location)
+            print(f"Waypoint in ego coordinates: {waypoint_in_ego}")
+
             # create a list of waypoints each 0.1 meters apart until 200 m ahead
             list_of_waypoints = []
             for i in range(200):
@@ -737,7 +753,12 @@ def run_simulation_with_casadi():
                 )
 
                 # Control preceding vehicle (keep stationary)
-                control_cmd = agent.run_step()
+                # control_cmd = agent.run_step()
+                # set control command to zero speed
+                control_cmd = carla.VehicleControl()
+                control_cmd.throttle = 0.1
+                control_cmd.brake = 0.0  # Full brake to keep it stationary
+                control_cmd.steer = 0.0  # No steering
                 preceding_vehicle_actor.apply_control(control_cmd)
 
                 # Control ego vehicle with CasADi Frenet MPC
@@ -748,7 +769,7 @@ def run_simulation_with_casadi():
                 # apply a control to the left just driving the car into the left fence
                 # ego_control.steer = 0.5  # Adjust steering to the left
 
-                print(f"Control action: {ego_control.throttle:.2f}, {ego_control.steer:.2f}")
+                # print(f"Control action: {ego_control.throttle:.2f}, {ego_control.steer:.2f}")
 
                 ego_vehicle_actor.apply_control(ego_control)
 

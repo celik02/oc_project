@@ -306,6 +306,140 @@ class Vehicle:
         self.prev_loc = vehicle_location
         return s
 
+    # Add these methods to your Vehicle class
+    def create_ego_coordinate_system(self, use_current_transform=False):
+        """
+        Create a coordinate system with origin at the ego vehicle's spawn/current location,
+        with x-axis pointing forward, y-axis to the right, and z-axis up.
+        
+        Args:
+            use_current_transform: If True, use the vehicle's current transform instead of spawn transform
+            
+        Returns:
+            world_to_ego_matrix: 4x4 homogeneous transformation matrix to convert world to ego coordinates
+            ego_to_world_matrix: 4x4 homogeneous transformation matrix to convert ego to world coordinates
+        """
+        if not hasattr(self, 'transform_to_spawn'):
+            self.transform_to_spawn = self.actor.get_transform()
+        
+        vehicle_transform = self.actor.get_transform() if use_current_transform else self.transform_to_spawn
+        
+        # Extract position from transform
+        tx = vehicle_transform.location.x
+        ty = vehicle_transform.location.y
+        tz = vehicle_transform.location.z
+        
+        # Extract rotation from transform (in radians)
+        yaw = math.radians(vehicle_transform.rotation.yaw)
+        pitch = math.radians(vehicle_transform.rotation.pitch)
+        roll = math.radians(vehicle_transform.rotation.roll)
+        
+        # Create rotation matrices for each axis
+        # Rotation around Z-axis (yaw)
+        cos_yaw = math.cos(yaw)
+        sin_yaw = math.sin(yaw)
+        R_z = np.array([
+            [cos_yaw, -sin_yaw, 0],
+            [sin_yaw, cos_yaw, 0],
+            [0, 0, 1]
+        ])
+        
+        # Rotation around Y-axis (pitch)
+        cos_pitch = math.cos(pitch)
+        sin_pitch = math.sin(pitch)
+        R_y = np.array([
+            [cos_pitch, 0, sin_pitch],
+            [0, 1, 0],
+            [-sin_pitch, 0, cos_pitch]
+        ])
+        
+        # Rotation around X-axis (roll)
+        cos_roll = math.cos(roll)
+        sin_roll = math.sin(roll)
+        R_x = np.array([
+            [1, 0, 0],
+            [0, cos_roll, -sin_roll],
+            [0, sin_roll, cos_roll]
+        ])
+        
+        # Combine rotations (order: yaw, pitch, roll as per CARLA convention)
+        R = R_z @ R_y @ R_x
+        
+        # For world to ego transformation, we need the transpose of R
+        R_world_to_ego = R.T
+        
+        # Create homogeneous transformation matrix (world to ego)
+        world_to_ego = np.eye(4)
+        world_to_ego[:3, :3] = R_world_to_ego
+        
+        # Translation component (after rotation)
+        world_to_ego[:3, 3] = -R_world_to_ego @ np.array([tx, ty, tz])
+        
+        # Create inverse transformation matrix (ego to world)
+        ego_to_world = np.eye(4)
+        ego_to_world[:3, :3] = R
+        ego_to_world[:3, 3] = np.array([tx, ty, tz])
+        
+        return world_to_ego, ego_to_world
+
+    def world_to_ego_coordinates(self, point, use_current_transform=False):
+        """
+        Transform a point from world coordinates to ego vehicle coordinates.
+        
+        Args:
+            point: A world point (can be a carla.Location or a numpy array)
+            use_current_transform: If True, use the vehicle's current transform instead of spawn transform
+            
+        Returns:
+            The point in ego vehicle coordinates (numpy array)
+        """
+        world_to_ego, _ = self.create_ego_coordinate_system(use_current_transform)
+        
+        # Convert to homogeneous coordinates
+        if isinstance(point, carla.Location):
+            point_homogeneous = np.array([[point.x], [point.y], [point.z], [1]])
+        else:
+            point_homogeneous = np.array([[point[0]], [point[1]], [point[2]], [1]])
+        
+        # Transform the point
+        transformed_point = world_to_ego @ point_homogeneous
+        
+        return transformed_point[:3, 0]
+
+    def ego_to_world_coordinates(self, point, use_current_transform=False):
+        """
+        Transform a point from ego vehicle coordinates to world coordinates.
+        
+        Args:
+            point: A point in ego vehicle coordinates (numpy array)
+            use_current_transform: If True, use the vehicle's current transform instead of spawn transform
+            
+        Returns:
+            The point in world coordinates (numpy array)
+        """
+        _, ego_to_world = self.create_ego_coordinate_system(use_current_transform)
+        
+        # Convert to homogeneous coordinates
+        point_homogeneous = np.array([[point[0]], [point[1]], [point[2]], [1]])
+        
+        # Transform the point
+        transformed_point = ego_to_world @ point_homogeneous
+        
+        return transformed_point[:3, 0]
+
+    def get_transform_matrices(self, use_current_transform=False):
+        """
+        Get both transformation matrices (world to ego and ego to world).
+        
+        Args:
+            use_current_transform: If True, use the vehicle's current transform instead of spawn transform
+            
+        Returns:
+            world_to_ego_matrix: 4x4 homogeneous transformation matrix
+            ego_to_world_matrix: 4x4 homogeneous transformation matrix
+        """
+        return self.create_ego_coordinate_system(use_current_transform)
+
 
 def throttle_brake_mapping1(a):
     if a >= 0:
