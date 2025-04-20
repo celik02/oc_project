@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.WARNING)
 FORMAT = "[%(asctime)s.%(msecs)03d %(filename)15s:%(lineno)3s - %(funcName)17s() ] %(levelname)s %(message)s"
 logging.basicConfig(level=logging.DEBUG, stream=sys.stdout, force=True, format=FORMAT, datefmt='%H:%M:%S')
-dt = 0.1  # seconds
+dt = 0.05  # seconds
 SPAWN_LOCATION = [
     111.229362,
     13.511219,
@@ -612,7 +612,7 @@ def run_simulation_with_casadi():
         world_to_ego, ego_to_world = ego_vehicle.get_transform_matrices()
         
         # Create bicycle model MPC controller
-        mpc_controller = BicycleMPCController(horizon=30, dt=dt, carla_manager=carla_manager)
+        mpc_controller = BicycleMPCController(horizon=20, dt=dt, carla_manager=carla_manager)
         
         # Target speed (m/s)
         target_speed = 20 / 3.6  # 20 km/h

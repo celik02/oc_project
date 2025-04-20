@@ -482,6 +482,15 @@ class Vehicle:
             accel = -control.brake * 3.0    # Approximate based on brake
         
         return np.array([x, y, psi, speed, accel])
+    
+    def get_vehicle_state_kalman(self, use_current_transform=False):
+        """
+        Get the vehicle state from the Kalman filter.
+        
+        Returns:
+            State vector: numpy array [x, y, psi, v, a]
+        """
+        
 
 def throttle_brake_mapping1(a):
     if a >= 0:
