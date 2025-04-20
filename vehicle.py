@@ -439,7 +439,49 @@ class Vehicle:
             ego_to_world_matrix: 4x4 homogeneous transformation matrix
         """
         return self.create_ego_coordinate_system(use_current_transform)
+    
+    def get_vehicle_state(self, use_current_transform=False):
+        """
+        Get the full bicycle model state vector [x, y, psi, v, a] for the vehicle.
+        
+        Returns:
+            State vector: numpy array [x, y, psi, v, a]
+        """
+        # Get the vehicle transform in world coordinates
+        vehicle_transform = self.actor.get_transform()
+        
+        # Get position
+        x = vehicle_transform.location.x
+        y = vehicle_transform.location.y
+        # traform to ego coordinates if necessary
+        x, y, _ = self.world_to_ego_coordinates((x, y, vehicle_transform.location.z), use_current_transform)
 
+        # Get orientation (psi)
+        if use_current_transform:
+            # When using current transform, psi is zero in ego coordinates
+            psi = 0.0
+        else:
+            # When using spawn transform as reference, we need to calculate relative yaw
+            current_yaw = math.radians(vehicle_transform.rotation.yaw)
+            spawn_yaw = math.radians(self.transform_to_spawn.rotation.yaw)
+            psi = (current_yaw - spawn_yaw) % (2 * math.pi)
+            
+            # Normalize to [-pi, pi]
+            if psi > math.pi:
+                psi -= 2 * math.pi
+        
+        # Get velocity
+        velocity = self.actor.get_velocity()
+        speed = math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
+        
+        # Estimate acceleration from control inputs
+        control = self.actor.get_control()
+        if control.throttle > 0:
+            accel = control.throttle * 3.0  # Approximate based on throttle
+        else:
+            accel = -control.brake * 3.0    # Approximate based on brake
+        
+        return np.array([x, y, psi, speed, accel])
 
 def throttle_brake_mapping1(a):
     if a >= 0:
