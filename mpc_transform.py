@@ -21,7 +21,7 @@ SPAWN_LOCATION = [
     14.171306,
 ]  # for spectator camera
 
-PRECEDING_SPEED = 0  # m/s, speed of the preceding vehicle
+PRECEDING_SPEED = 15 / 3.6  # m/s, speed of the preceding vehicle
 
 # synchronous_mode will make the simulation predictable
 synchronous_mode = True
@@ -89,7 +89,7 @@ class BicycleMPCController:
         self.w_accel = 1.0      # Acceleration minimization
         self.w_steer = 1.0      # Steering minimization
         self.w_jerk = 5.0       # Jerk minimization (change in acceleration)
-        self.w_steer_rate = 5.0 # Steering rate minimization
+        self.w_steer_rate = 10.0 # Steering rate minimization
 
         # Initialize CasADi solver
         self.solver = None
@@ -113,12 +113,12 @@ class BicycleMPCController:
         
         # Get preceding vehicle position in ego coordinates
         preceding_location = preceding_vehicle.actor.get_location()
-        preceding_pos = ego_vehicle.world_to_ego_coordinates(preceding_location)
+        preceding_pos_in_ego = ego_vehicle.world_to_ego_coordinates(preceding_location)
         
         # Generate preceding vehicle prediction
         # TODO: Right now we are assuming we know the initial speed and the orientation of the preceding vehicle
         preceding_vehicle_pred = self.predict_vehicle_trajectory(
-            preceding_pos, PRECEDING_SPEED)
+            preceding_pos_in_ego, PRECEDING_SPEED)
         
         # Create reference path (straight ahead in ego coordinates)
         reference_path = self.generate_reference_path(x0[0])
@@ -236,8 +236,8 @@ class BicycleMPCController:
             
             # Collision avoidance with preceding vehicle
             # Define ellipsoid safety zone
-            a = 6.0  # Longitudinal semi-axis
-            b = 2.5  # Lateral semi-axis
+            a = 8.0  # Longitudinal semi-axis
+            b = 3.0  # Lateral semi-axis
             
             # Distance to preceding vehicle at step k
             dx = xk[0] - preceding_x[k]
@@ -572,20 +572,31 @@ def run_simulation_with_casadi():
         # Basic agent for preceding vehicle
         preceding_agent = BasicAgent(preceding_vehicle_actor, target_speed=PRECEDING_SPEED)  # 5 km/h
         
+        
         # Set destination
         current_location = preceding_vehicle_actor.get_location()
+        # Create a sequence of waypoints for the preceding vehicle to follow
+        waypoints = []
         current_wp = carla_manager.map.get_waypoint(current_location, project_to_road=True)
-        next_wps = current_wp.next(100.0)  # 100 meters ahead
+            
+        # Get the next 20 waypoints, 5 meters apart
+        next_wp = current_wp
+        for _ in range(20):
+            next_waypoints = next_wp.next(5.0)
+            if next_waypoints:
+                next_wp = next_waypoints[0]
+                waypoints.append(next_wp.transform.location)
+            else:
+                break
+
+        # Set the first waypoint as the initial destination
+        if waypoints:
+            preceding_agent.set_destination(waypoints[0])
         
-        if next_wps:
-            destination = next_wps[0].transform.location
-        else:
-            destination = current_location
-        preceding_agent.set_destination(destination)
-        
+
         # Spawn ego vehicle behind preceding vehicle
         spawn_loc_copy = SPAWN_LOCATION.copy()
-        spawn_loc_copy[0] += 20  # 20 meters behind
+        spawn_loc_copy[0] += 10  # 20 meters behind
         ego_vehicle_actor = carla_manager.spawn_vehicle("vehicle.tesla.model3", spawn_loc_copy)
         
         if synchronous_mode:
@@ -601,18 +612,56 @@ def run_simulation_with_casadi():
         world_to_ego, ego_to_world = ego_vehicle.get_transform_matrices()
         
         # Create bicycle model MPC controller
-        mpc_controller = BicycleMPCController(horizon=50, dt=dt, carla_manager=carla_manager)
+        mpc_controller = BicycleMPCController(horizon=30, dt=dt, carla_manager=carla_manager)
         
         # Target speed (m/s)
-        target_speed = 10 / 3.6  # 20 km/h
+        target_speed = 20 / 3.6  # 20 km/h
         
         # Main control loop
         try:
             print("Starting simulation with bicycle MPC. Press Ctrl+C to exit...")
-            
+            preceding_speed_error_prev = 0.0  # Initialize previous speed error
+            preceding_steer_error_prev = 0.0  # Initialize previous steering error
+            kp_speed = 0.5
+            kd_speed = 0.1
+            kp_steer = 0.5
+            kd_steer = 0.1
             while True:
+
+                # In your main simulation loop
+                current_preceding_location = preceding_vehicle_actor.get_location()
+
                 # Update preceding vehicle
-                control_cmd = preceding_agent.run_step()
+                # control_cmd = preceding_agent.run_step()
+                control_cmd = carla.VehicleControl()
+                # Set a constant speed for the preceding vehicle using a PD controller on the vehicle's speed
+                error_speed = PRECEDING_SPEED - preceding_vehicle_actor.get_velocity().length()
+                # PD control for speed
+                PD_preceding_control = kp_speed * error_speed + kd_speed * (error_speed - preceding_speed_error_prev) / dt
+                preceding_speed_error_prev = error_speed
+                # Apply control to preceding vehicle
+                if PD_preceding_control > 0:
+                    control_cmd.throttle = min(PD_preceding_control, 1.0)
+                    control_cmd.brake = 0.0
+                else:
+                    control_cmd.throttle = 0.0
+                    control_cmd.brake = min(-PD_preceding_control, 1.0)
+                
+                # Apply another PD control for the steering angle to keep the preceding lane following
+                # get the error of the vehicle's heading compared to the road direction
+                road_wp = carla_manager.map.get_waypoint(current_preceding_location, project_to_road=True)
+                road_direction = road_wp.transform.get_forward_vector()
+                vehicle_direction = preceding_vehicle_actor.get_transform().get_forward_vector()
+                road_heading = np.arctan2(road_direction.y, road_direction.x)
+                vehicle_heading = np.arctan2(vehicle_direction.y, vehicle_direction.x)
+                heading_error = road_heading - vehicle_heading
+                # normalize heading error to [-1, 1]
+                heading_error = heading_error / np.pi  # Normalize to [-1, 1]
+                control_steer = kp_steer * heading_error + kd_steer * (heading_error - preceding_steer_error_prev) / dt
+                # clip control steer to [-1, 1]
+                control_steer = np.clip(control_steer, -1.0, 1.0)
+                control_cmd.steer = control_steer
+                # Apply control to preceding vehicle
                 preceding_vehicle_actor.apply_control(control_cmd)
                 
                 # Get MPC control for ego vehicle
@@ -622,12 +671,6 @@ def run_simulation_with_casadi():
                 
                 # Apply control to ego vehicle
                 ego_vehicle_actor.apply_control(ego_control)
-                
-                # Print diagnostic info
-                ego_vel = ego_vehicle_actor.get_velocity()
-                ego_speed = np.sqrt(ego_vel.x**2 + ego_vel.y**2 + ego_vel.z**2)
-                preceding_pos = ego_vehicle.world_to_ego_coordinates(
-                    preceding_vehicle_actor.get_location())
                                 
                 # Advance simulation
                 carla_manager.world.tick()
