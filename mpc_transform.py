@@ -21,7 +21,7 @@ SPAWN_LOCATION = [
     14.171306,
 ]  # for spectator camera
 
-PRECEDING_SPEED = 15 / 3.6  # m/s, speed of the preceding vehicle
+PRECEDING_SPEED = 10 / 3.6  # m/s, speed of the preceding vehicle
 
 # synchronous_mode will make the simulation predictable
 synchronous_mode = True
@@ -235,7 +235,7 @@ class BicycleMPCController:
             
             # Collision avoidance with preceding vehicle
             # Define ellipsoid safety zone
-            a = 8.0  # Longitudinal semi-axis
+            a = 6.0  # Longitudinal semi-axis
             b = 3.0  # Lateral semi-axis
             
             # Distance to preceding vehicle at step k
@@ -367,7 +367,7 @@ class BicycleMPCController:
                 print(f"Warning: Solver status: {stats['return_status']}")
                 # Return zero steering and negative acceleration as fallback
                 control = np.zeros((self.horizon, self.num_controls))
-                control[:, 0] = -self.min_accel / 4  # Negative acceleration
+                control[:, 0] = self.min_accel / 100  # Negative acceleration
                 return control
             else:
                 print(f"Solver succeeded: {stats['return_status']}")
@@ -601,7 +601,7 @@ def run_simulation_with_casadi():
 
         # Spawn ego vehicle behind preceding vehicle
         spawn_loc_copy = SPAWN_LOCATION.copy()
-        spawn_loc_copy[0] += 10  # 20 meters behind
+        spawn_loc_copy[0] += 20  # 20 meters behind
         ego_vehicle_actor = carla_manager.spawn_vehicle("vehicle.tesla.model3", spawn_loc_copy)
         
         if synchronous_mode:
@@ -617,10 +617,10 @@ def run_simulation_with_casadi():
         world_to_ego, ego_to_world = ego_vehicle.get_transform_matrices()
         
         # Create bicycle model MPC controller
-        mpc_controller = BicycleMPCController(horizon=40, dt=dt, carla_manager=carla_manager)
+        mpc_controller = BicycleMPCController(horizon=50, dt=dt, carla_manager=carla_manager)
         
         # Target speed (m/s)
-        target_speed = 20 / 3.6  # 20 km/h
+        target_speed = 25 / 3.6  # 20 km/h
         
         # Main control loop
         try:
