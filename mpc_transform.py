@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.WARNING)
 FORMAT = "[%(asctime)s.%(msecs)03d %(filename)15s:%(lineno)3s - %(funcName)17s() ] %(levelname)s %(message)s"
 logging.basicConfig(level=logging.DEBUG, stream=sys.stdout, force=True, format=FORMAT, datefmt='%H:%M:%S')
-dt = 0.05  # seconds
+dt = 0.1  # seconds
 SPAWN_LOCATION = [
     111.229362,
     13.511219,
@@ -109,7 +109,6 @@ class BicycleMPCController:
         """
         # Get ego vehicle state
         x0 = ego_vehicle.get_vehicle_state()
-        print(f"Ego vehicle state: {x0}")
         
         # Get preceding vehicle position in ego coordinates
         preceding_location = preceding_vehicle.actor.get_location()
@@ -366,7 +365,13 @@ class BicycleMPCController:
             stats = self.solver.stats()
             if stats['return_status'] not in ['Solve_Succeeded', 'Solved_To_Acceptable_Level']:
                 print(f"Warning: Solver status: {stats['return_status']}")
-            
+                # Return zero steering and negative acceleration as fallback
+                control = np.zeros((self.horizon, self.num_controls))
+                control[:, 0] = -self.min_accel / 4  # Negative acceleration
+                return control
+            else:
+                print(f"Solver succeeded: {stats['return_status']}")
+
             # Extract solution
             x_opt = sol['x'].full().flatten()
             
@@ -612,7 +617,7 @@ def run_simulation_with_casadi():
         world_to_ego, ego_to_world = ego_vehicle.get_transform_matrices()
         
         # Create bicycle model MPC controller
-        mpc_controller = BicycleMPCController(horizon=20, dt=dt, carla_manager=carla_manager)
+        mpc_controller = BicycleMPCController(horizon=40, dt=dt, carla_manager=carla_manager)
         
         # Target speed (m/s)
         target_speed = 20 / 3.6  # 20 km/h
