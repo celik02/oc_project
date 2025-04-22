@@ -14,9 +14,9 @@ class CustomEKF_NEW(ExtendedKalmanFilter):
         self.dim_u = dim_u  # Control dimension
         self.u = None  # Control input
         self.prev_yaw = None  # Previous yaw angle
-        self.prev_yaw_update = None  # Previous yaw angle update time
+        self.cumulative_yaw = 0.0  # For continuous tracking
 
-    def predict_x(self, u=0,  dt=0.1):
+    def predict_x(self, u=0,  dt=0.01):
         if u is not None:
             self.u = u
         # F updated with the current state estimate and control input
@@ -25,29 +25,31 @@ class CustomEKF_NEW(ExtendedKalmanFilter):
         self.x = self.vehicle_dynamics(self.x, dt, self.u)  # state prediction
         logger.debug('Predicting state:%s', self.x)
 
-    # def predict_x_imu(self, imu_data=None, dt=0.01):
-    #     """
-    #     Predict the state using IMU data.
-    #     :param imu_data: IMU data to use for prediction
-    #     :param dt: Time step for prediction
-    #     """
-    #     if imu_data is None:
-    #         return
-    #     # IMU reference frame aligned with the vehicle's coordinate system
-    #     # I need ax for forward acceleration,
-    #     # gz for angular rate around z-axis (yaw rate)
-    #     ax, ay, az, gx, gy, gz = imu_data
-    #     u = [ax, gz]
-    #     # Use the IMU data to predict the state
-    #     self.F = self.F_jacobian(self.x, dt, u=u, imu_prediction=True)
-    #     self.x = self.vehicle_dynamics(self.x, dt, u=u, imu_prediction=True)  # state prediction
+    def predict_x_imu(self, imu_data=None, dt=0.01):
+        """
+        Predict the state using IMU data.
+        :param imu_data: IMU data to use for prediction
+        :param dt: Time step for prediction
+        """
+        if imu_data is None:
+            return
+        # IMU reference frame aligned with the vehicle's coordinate system
+        # I need ax for forward acceleration,
+        # gz for angular rate around z-axis (yaw rate)
+        ax, ay, az, gx, gy, gz = imu_data
+        u = [ax, -gz]
+        # Use the IMU data to predict the state
+        self.F = self.F_jacobian(self.x, dt, u=u, imu_prediction=True)
+        self.x = self.vehicle_dynamics(self.x, dt, u=u, imu_prediction=True)  # state prediction
 
-    #     # self.P = dot(self.F, self.P).dot(self.F.T) + self.Q  # this is prior
-    #     logger.debug('Predicting with IMU data:%s', self.x)
+        logger.debug('Predicting with IMU data:%s', self.x)
 
-    def predict(self, u=None):
+    def predict(self, u=None, imu_prediction=False, dt=0.01):
         logger.debug('inside predict:%s', u)
-        self.predict_x(u)
+        if imu_prediction:
+            self.predict_x_imu(u, dt)
+        else:
+            self.predict_x(u, dt)
         self.P = dot(self.F, self.P).dot(self.F.T) + self.Q  # this is prior
         # save prior
         self.x_prior = np.copy(self.x)
@@ -165,7 +167,7 @@ class CustomEKF_NEW(ExtendedKalmanFilter):
 
         self.u = None  # Reset control input after update
 
-    def vehicle_dynamics(self, x, dt, u):
+    def vehicle_dynamics(self, x, dt, u, imu_prediction=False):
         """
         Bicycle kinematic model with longitudinal dynamics
 
@@ -180,7 +182,7 @@ class CustomEKF_NEW(ExtendedKalmanFilter):
             u[1]: steering angle
         """
         # Vehicle parameters
-        L = 3  # Wheelbase # FIXME
+        L = 2.89  # Wheelbase # FIXME
         a = u[0]  # Acceleration command
         delta = u[1]  # Steering angle
 
@@ -188,30 +190,26 @@ class CustomEKF_NEW(ExtendedKalmanFilter):
         x_next = np.zeros_like(x)
         x_next[0] = x[0] + x[3] * np.cos(x[2]) * dt
         x_next[1] = x[1] + x[3] * np.sin(x[2]) * dt
-        x_next[2] = x[2] + x[3] * np.tan(delta) / L * dt
+        if imu_prediction:
+            # If using IMU prediction, we can skip the heading update from control input
+            # This is a placeholder for IMU prediction
+            x_next[2] = x[2] + u[1] * dt
+            # normalize heading
+            x_next[2] = wrap_to_pi(x_next[2])
+
+        else:
+            x_next[2] = x[2] + x[3] * np.tan(delta) / L * dt
         x_next[3] = x[3] + a * dt
 
-        # normalize heading
-        # x_next[2] = wrap_to_pi(x_next[2])
-
-        # if self.prev_yaw is not None:
-        #     # Calculate the difference between the current and previous yaw angles
-        #     yaw_diff = x_next[2] - self.prev_yaw
-        #     # Normalize the yaw difference to be within [-pi, pi]
-        #     yaw_diff = (yaw_diff + np.pi) % (2 * np.pi) - np.pi
-        #     # Update the previous yaw angle
-        #     self.prev_yaw = x_next[2]
-        #     x_next[2] = self.prev_yaw + yaw_diff
-        # else:
-        #     # If this is the first prediction, just set the previous yaw to the current one
-        #     self.prev_yaw = x_next[2]
-        # # Normalize the yaw angle to be within [-pi, pi]
-        # x_next[2] = (x_next[2] + np.pi) % (2 * np.pi) - np.pi
-        # # x_next[2] = -3.14
         return x_next
 
     @staticmethod
-    def F_jacobian(x, dt, u):
+    def angle_diff(a, b):
+        """Calculate the smallest angle difference"""
+        return ((a - b + np.pi) % (2 * np.pi)) - np.pi
+
+    @staticmethod
+    def F_jacobian(x, dt, u, imu_prediction=False):
         """
         Jacobian of the vehicle dynamics model
         """
@@ -233,7 +231,11 @@ class CustomEKF_NEW(ExtendedKalmanFilter):
 
         F[2, 2] = 1
 
-        F[2, 3] = (np.tan(delta) / L) * dt
+        if imu_prediction:
+            # If using IMU prediction, we can skip the heading update from control input
+            F[2, 3] = 0
+        else:
+            F[2, 3] = (np.tan(delta) / L) * dt
 
         F[3, 3] = 1
 

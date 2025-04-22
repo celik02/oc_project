@@ -32,7 +32,7 @@ class Vehicle:
         self.imu_data_queue = queue.Queue(maxsize=10)
         self.gps_data_queue = queue.Queue(maxsize=5)
         self.state_lock = threading.Lock()
-        self.latest_state = np.zeros(5)  # Initialize latest state to zero, will be updated by EKF]
+        self.latest_ekf_state = np.zeros(5)  # Initialize latest state to zero, will be updated by EKF]
         self.wheel_base = 2.5  # Example wheel base, adjust as necessary  # FIXME
 
         # initialize states
@@ -83,7 +83,8 @@ class Vehicle:
                 logger.debug("Waiting for GPS data to initialize EKF")
 
         yaw = self.actor.get_transform().rotation.yaw
-        self.ekf.x[2] = np.radians(yaw) % (2 * np.pi)
+        self.ekf.x[2] = (np.radians(yaw) + np.pi) % (2*np.pi) - np.pi
+        self.ekf.x_prior = self.ekf.x.copy()
 
     def _gps_callback(self, data):
         """
@@ -126,7 +127,7 @@ class Vehicle:
         # TODO if necessary data could be put into thread safe queue
         # Extract IMU data
         self.imu_data = data
-        self.imu_data_array = np.array([-self.imu_data.accelerometer.x, self.imu_data.accelerometer.y, self.imu_data.accelerometer.z,
+        self.imu_data_array = np.array([self.imu_data.accelerometer.x, self.imu_data.accelerometer.y, self.imu_data.accelerometer.z,
                                         self.imu_data.gyroscope.x, self.imu_data.gyroscope.y, self.imu_data.gyroscope.z])
         logger.debug("Received IMU data callback %s ", self.imu_data_array)
         # print(f"IMU data received: {self.imu_data_array}")
@@ -182,12 +183,13 @@ class Vehicle:
             traceback.print_exc()
 
         with self.state_lock:
-            self.latest_state = self.ekf.x.copy()
+            self.latest_ekf_state = self.ekf.x.copy()
 
     def get_latest_state(self):
         ''' returns the latest state of the vehicle from the EKF'''
+        # states are [x, y, psi, v] in global coordinates
         with self.state_lock:
-            return self.latest_state
+            return self.latest_ekf_state
 
     def get_frenet_states(self, next_waypoint):
         """
@@ -311,29 +313,29 @@ class Vehicle:
         """
         Create a coordinate system with origin at the ego vehicle's spawn/current location,
         with x-axis pointing forward, y-axis to the right, and z-axis up.
-        
+
         Args:
             use_current_transform: If True, use the vehicle's current transform instead of spawn transform
-            
+
         Returns:
             world_to_ego_matrix: 4x4 homogeneous transformation matrix to convert world to ego coordinates
             ego_to_world_matrix: 4x4 homogeneous transformation matrix to convert ego to world coordinates
         """
         if not hasattr(self, 'transform_to_spawn'):
             self.transform_to_spawn = self.actor.get_transform()
-        
+
         vehicle_transform = self.actor.get_transform() if use_current_transform else self.transform_to_spawn
-        
+
         # Extract position from transform
         tx = vehicle_transform.location.x
         ty = vehicle_transform.location.y
         tz = vehicle_transform.location.z
-        
+
         # Extract rotation from transform (in radians)
         yaw = math.radians(vehicle_transform.rotation.yaw)
         pitch = math.radians(vehicle_transform.rotation.pitch)
         roll = math.radians(vehicle_transform.rotation.roll)
-        
+
         # Create rotation matrices for each axis
         # Rotation around Z-axis (yaw)
         cos_yaw = math.cos(yaw)
@@ -343,7 +345,7 @@ class Vehicle:
             [sin_yaw, cos_yaw, 0],
             [0, 0, 1]
         ])
-        
+
         # Rotation around Y-axis (pitch)
         cos_pitch = math.cos(pitch)
         sin_pitch = math.sin(pitch)
@@ -352,7 +354,7 @@ class Vehicle:
             [0, 1, 0],
             [-sin_pitch, 0, cos_pitch]
         ])
-        
+
         # Rotation around X-axis (roll)
         cos_roll = math.cos(roll)
         sin_roll = math.sin(roll)
@@ -361,95 +363,95 @@ class Vehicle:
             [0, cos_roll, -sin_roll],
             [0, sin_roll, cos_roll]
         ])
-        
+
         # Combine rotations (order: yaw, pitch, roll as per CARLA convention)
         R = R_z @ R_y @ R_x
-        
+
         # For world to ego transformation, we need the transpose of R
         R_world_to_ego = R.T
-        
+
         # Create homogeneous transformation matrix (world to ego)
         world_to_ego = np.eye(4)
         world_to_ego[:3, :3] = R_world_to_ego
-        
+
         # Translation component (after rotation)
         world_to_ego[:3, 3] = -R_world_to_ego @ np.array([tx, ty, tz])
-        
+
         # Create inverse transformation matrix (ego to world)
         ego_to_world = np.eye(4)
         ego_to_world[:3, :3] = R
         ego_to_world[:3, 3] = np.array([tx, ty, tz])
-        
+
         return world_to_ego, ego_to_world
 
     def world_to_ego_coordinates(self, point, use_current_transform=False):
         """
         Transform a point from world coordinates to ego vehicle coordinates.
-        
+
         Args:
             point: A world point (can be a carla.Location or a numpy array)
             use_current_transform: If True, use the vehicle's current transform instead of spawn transform
-            
+
         Returns:
             The point in ego vehicle coordinates (numpy array)
         """
         world_to_ego, _ = self.create_ego_coordinate_system(use_current_transform)
-        
+
         # Convert to homogeneous coordinates
         if isinstance(point, carla.Location):
             point_homogeneous = np.array([[point.x], [point.y], [point.z], [1]])
         else:
             point_homogeneous = np.array([[point[0]], [point[1]], [point[2]], [1]])
-        
+
         # Transform the point
         transformed_point = world_to_ego @ point_homogeneous
-        
+
         return transformed_point[:3, 0]
 
     def ego_to_world_coordinates(self, point, use_current_transform=False):
         """
         Transform a point from ego vehicle coordinates to world coordinates.
-        
+
         Args:
             point: A point in ego vehicle coordinates (numpy array)
             use_current_transform: If True, use the vehicle's current transform instead of spawn transform
-            
+
         Returns:
             The point in world coordinates (numpy array)
         """
         _, ego_to_world = self.create_ego_coordinate_system(use_current_transform)
-        
+
         # Convert to homogeneous coordinates
         point_homogeneous = np.array([[point[0]], [point[1]], [point[2]], [1]])
-        
+
         # Transform the point
         transformed_point = ego_to_world @ point_homogeneous
-        
+
         return transformed_point[:3, 0]
 
     def get_transform_matrices(self, use_current_transform=False):
         """
         Get both transformation matrices (world to ego and ego to world).
-        
+
         Args:
             use_current_transform: If True, use the vehicle's current transform instead of spawn transform
-            
+
         Returns:
             world_to_ego_matrix: 4x4 homogeneous transformation matrix
             ego_to_world_matrix: 4x4 homogeneous transformation matrix
         """
         return self.create_ego_coordinate_system(use_current_transform)
-    
+
     def get_vehicle_state(self, use_current_transform=False):
         """
         Get the full bicycle model state vector [x, y, psi, v, a] for the vehicle.
-        
+
         Returns:
             State vector: numpy array [x, y, psi, v, a]
         """
         # Get the vehicle transform in world coordinates
         vehicle_transform = self.actor.get_transform()
-        
+
         # Get position
         x = vehicle_transform.location.x
         y = vehicle_transform.location.y
@@ -465,32 +467,32 @@ class Vehicle:
             current_yaw = math.radians(vehicle_transform.rotation.yaw)
             spawn_yaw = math.radians(self.transform_to_spawn.rotation.yaw)
             psi = (current_yaw - spawn_yaw) % (2 * math.pi)
-            
+
             # Normalize to [-pi, pi]
             if psi > math.pi:
                 psi -= 2 * math.pi
-        
+
         # Get velocity
         velocity = self.actor.get_velocity()
         speed = math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
-        
+
         # Estimate acceleration from control inputs
         control = self.actor.get_control()
         if control.throttle > 0:
             accel = control.throttle * 3.0  # Approximate based on throttle
         else:
             accel = -control.brake * 3.0    # Approximate based on brake
-        
+
         return np.array([x, y, psi, speed, accel])
-    
+
     def get_vehicle_state_kalman(self, use_current_transform=False):
         """
         Get the vehicle state from the Kalman filter.
-        
+
         Returns:
             State vector: numpy array [x, y, psi, v, a]
         """
-        
+
 
 def throttle_brake_mapping1(a):
     if a >= 0:

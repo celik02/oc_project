@@ -1,13 +1,13 @@
 # configs/imu.yaml
 blueprint: sensor.other.imu
-sensor_tick: 0.01
+sensor_tick: 0.1
 noise_seed: 0
-noise_accel_stddev_x: 0  # Standard deviation of noise in the x-axis acceleration (m/s^2)
-noise_gyro_stddev_z: 0  # Standard deviation of noise in the y-axis acceleration (m/s^2)
+noise_accel_stddev_x: 0.1  # Standard deviation of noise in the x-axis acceleration (m/s^2)
+noise_gyro_stddev_z: 0.2  # Standard deviation of noise in the y-axis acceleration (m/s^2)
 location:
   x: 0
   y: 0
-  z: 2.0
+  z: 0.0
 rotation:
   pitch: 0
   yaw: 0

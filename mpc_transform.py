@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.WARNING)
 FORMAT = "[%(asctime)s.%(msecs)03d %(filename)15s:%(lineno)3s - %(funcName)17s() ] %(levelname)s %(message)s"
 logging.basicConfig(level=logging.DEBUG, stream=sys.stdout, force=True, format=FORMAT, datefmt='%H:%M:%S')
-dt = 0.05  # seconds
+dt = 0.1  # seconds
 SPAWN_LOCATION = [
     111.229362,
     13.511219,
@@ -30,10 +30,8 @@ synchronous_mode = True
 def bicycle_vehicle_dynamics_casadi(x, u, dt):
     """
     CasADi implementation of bicycle kinematic model in global coordinates.
-    
     State vector x = [x, y, psi, v, a]  # Position, heading, velocity, acceleration
     Control vector u = [delta, u_a]      # Steering angle, acceleration command
-    
     Returns the next state after time dt using Euler integration.
     """
     # Vehicle parameters
@@ -94,50 +92,50 @@ class BicycleMPCController:
         # Initialize CasADi solver
         self.solver = None
         self.casadi_setup_done = False
-        
+
     def run_step(self, ego_vehicle, preceding_vehicle, target_speed):
         """
         Execute one step of MPC control using bicycle model
-        
+
         Args:
             ego_vehicle: Vehicle class instance for ego vehicle
             preceding_vehicle: Vehicle class instance for preceding vehicle
             target_speed: Desired speed in m/s
-            
+
         Returns:
             carla.VehicleControl object
         """
         # Get ego vehicle state
         x0 = ego_vehicle.get_vehicle_state()
         print(f"Ego vehicle state: {x0}")
-        
+
         # Get preceding vehicle position in ego coordinates
         preceding_location = preceding_vehicle.actor.get_location()
         preceding_pos_in_ego = ego_vehicle.world_to_ego_coordinates(preceding_location)
-        
+
         # Generate preceding vehicle prediction
         # TODO: Right now we are assuming we know the initial speed and the orientation of the preceding vehicle
         preceding_vehicle_pred = self.predict_vehicle_trajectory(
             preceding_pos_in_ego, PRECEDING_SPEED)
-        
+
         # Create reference path (straight ahead in ego coordinates)
         reference_path = self.generate_reference_path(x0[0])
 
-        
+
         # Initialize or update CasADi solver
         if not self.casadi_setup_done:
             self.setup_casadi_solver()
             self.casadi_setup_done = True
-        
+
         # Solve optimization problem
         u_optimal = self.solve_with_casadi(
             x0, preceding_vehicle_pred, target_speed, reference_path)
-        
+
         # Convert to CARLA control
         control = self.convert_to_control(u_optimal[0])
-        
+
         return control
-        
+
     def predict_vehicle_trajectory(self, position, speed, heading=0.0):
         """
         Predict trajectory using constant velocity model
@@ -146,15 +144,15 @@ class BicycleMPCController:
         x, y = position[0], position[1]
         vx = speed * np.cos(heading)
         vy = speed * np.sin(heading)
-        
+
         for i in range(self.horizon):
             # Simple constant velocity prediction
             x += vx * self.dt
             y += vy * self.dt
             predictions.append((x, y))
-            
+
         return predictions
-        
+
     def generate_reference_path(self, x_start):
         """
         Generate a reference path in ego coordinates
@@ -168,19 +166,19 @@ class BicycleMPCController:
             path.append((x, y))
 
         return path
-    
+
     def setup_casadi_solver(self):
         """
         Setup the CasADi solver for MPC optimization with bicycle model.
         """
         print("Setting up CasADi solver...")
-        
+
         # State variables (symbolic)
         x = ca.SX.sym('x', 5)  # [x, y, psi, v, a]
-        
+
         # Control variables (symbolic)
         u = ca.SX.sym('u', 2)  # [u_a, delta]
-        
+
         # Parameters
         x0 = ca.SX.sym('x0', 5)  # Initial state
         preceding_x = ca.SX.sym('preceding_x', self.horizon)  # Preceding vehicle x positions
@@ -188,24 +186,24 @@ class BicycleMPCController:
         ref_path_x = ca.SX.sym('ref_path_x', self.horizon)    # Reference path x positions
         ref_path_y = ca.SX.sym('ref_path_y', self.horizon)    # Reference path y positions
         target_v = ca.SX.sym('target_v', 1)  # Target velocity
-        
+
         # Dynamics function
         dynamics_func = ca.Function('dynamics', [x, u], [bicycle_vehicle_dynamics_casadi(x, u, self.dt)])
-        
+
         # Initialize optimization problem
         obj = 0  # Objective function
         g = []   # Constraints
         lbg = [] # Lower bounds for constraints
         ubg = [] # Upper bounds for constraints
-        
+
         # Variables
         opt_vars = []
         opt_vars_lb = []
         opt_vars_ub = []
-        
+
         # Initial state
         xk = x0
-        
+
         # Control trajectory optimization
         for k in range(self.horizon):
             # Control variables at step k
@@ -213,19 +211,19 @@ class BicycleMPCController:
             opt_vars.append(uk)
             opt_vars_lb.extend([self.min_accel, self.min_steer])
             opt_vars_ub.extend([self.max_accel, self.max_steer])
-            
+
             # Path following cost
             path_error = (xk[0] - ref_path_x[k])**2 + (xk[1] - ref_path_y[k])**2
             obj += self.w_path * path_error
-            
+
             # Speed tracking cost
             speed_error = (xk[3] - target_v)**2
             obj += self.w_speed * speed_error
-            
+
             # Control effort costs
             obj += self.w_accel * uk[0]**2  # Acceleration command
             obj += self.w_steer * uk[1]**2  # Steering angle
-            
+
             # Control rate costs (if not first step)
             if k > 0:
                 prev_uk = opt_vars[-3]  # Previous control
@@ -233,46 +231,46 @@ class BicycleMPCController:
                 steer_rate = (uk[1] - prev_uk[1])/self.dt
                 obj += self.w_jerk * accel_rate**2
                 obj += self.w_steer_rate * steer_rate**2
-            
+
             # Collision avoidance with preceding vehicle
             # Define ellipsoid safety zone
             a = 8.0  # Longitudinal semi-axis
             b = 3.0  # Lateral semi-axis
-            
+
             # Distance to preceding vehicle at step k
             dx = xk[0] - preceding_x[k]
             dy = xk[1] - preceding_y[k]
-            
+
             # Ellipsoidal safety constraint: (dx/a)² + (dy/b)² >= 1
             safety_constraint = (dx/a)**2 + (dy/b)**2
             g.append(safety_constraint)
             lbg.append(1.0)  # Must be outside ellipsoid
             ubg.append(ca.inf)
-            
+
             # State propagation
             xk_next = dynamics_func(xk, uk)
-            
+
             # State constraints for next step
             if k < self.horizon - 1:
                 # New state variables
                 xk_next_var = ca.SX.sym(f'x_{k+1}', 5)
                 opt_vars.append(xk_next_var)
-                
+
                 # State bounds
                 opt_vars_lb.extend([-ca.inf, -ca.inf, -ca.inf, 0, self.min_accel])  # v >= 0, a >= -5
                 opt_vars_ub.extend([ca.inf, ca.inf, ca.inf, 40, 5.0])     #self.max_accel<= 40, a <= 5
-                
+
                 # Dynamics constraints (next state follows dynamics model)
                 g.append(xk_next_var - xk_next)
                 lbg.extend([0, 0, 0, 0, 0])  # Equality constraints
                 ubg.extend([0, 0, 0, 0, 0])
-                
+
                 # Update for next iteration
                 xk = xk_next_var
-        
+
         # Create optimization vector
         opt_vars = ca.vertcat(*opt_vars)
-        
+
         # NLP problem formulation
         nlp = {
             'x': opt_vars,
@@ -280,7 +278,7 @@ class BicycleMPCController:
             'g': ca.vertcat(*g),
             'p': ca.vertcat(x0, preceding_x, preceding_y, ref_path_x, ref_path_y, target_v)
         }
-        
+
         # Solver options
         opts = {
             'ipopt': {
@@ -291,19 +289,19 @@ class BicycleMPCController:
             },
             'print_time': False
         }
-        
+
         # Store constraint bounds
         self.lbg = lbg
         self.ubg = ubg
-        
+
         # Create solver
         self.solver = ca.nlpsol('solver', 'ipopt', nlp, opts)
-        
+
         # Store problem dimensions
         self.num_states = 5
         self.num_controls = 2
         self.opt_vars_size = opt_vars.size1()
-        
+
         print("CasADi solver setup complete!")
 
     def solve_with_casadi(self, x0, preceding_vehicle_pred, target_speed, reference_path):
@@ -314,20 +312,20 @@ class BicycleMPCController:
             # Extract preceding vehicle prediction data
             preceding_x = np.array([pred[0] for pred in preceding_vehicle_pred])
             preceding_y = np.array([pred[1] for pred in preceding_vehicle_pred])
-            
+
             # Extract reference path
             ref_x = np.array([point[0] for point in reference_path])
             ref_y = np.array([point[1] for point in reference_path])
-            
+
             # Ensure arrays are of correct length
             if len(ref_x) < self.horizon:
                 # Pad if reference path is too short
                 ref_x = np.pad(ref_x, (0, self.horizon - len(ref_x)), 'edge')
                 ref_y = np.pad(ref_y, (0, self.horizon - len(ref_y)), 'edge')
-            
+
             # Initial guess (all zeros)
             x_init = np.zeros(self.opt_vars_size)
-            
+
             # Pack parameters
             p = np.concatenate([
                 x0.flatten(),
@@ -337,21 +335,21 @@ class BicycleMPCController:
                 ref_y.flatten(),
                 [target_speed]
             ])
-            
+
             # Bounds for variables
             lbx = []
             ubx = []
-            
+
             for i in range(self.horizon):
                 # Control bounds
                 lbx.extend([self.min_accel, self.min_steer])
                 ubx.extend([self.max_accel, self.max_steer])
-                
+
                 # State bounds (except for last step)
                 if i < self.horizon - 1:
                     lbx.extend([-ca.inf, -ca.inf, -ca.inf, 0, self.min_accel])
                     ubx.extend([ca.inf, ca.inf, ca.inf, 40, self.max_accel])
-            
+
             # Solve optimization
             sol = self.solver(
                 x0=x_init,
@@ -361,15 +359,15 @@ class BicycleMPCController:
                 ubg=self.ubg,
                 p=p
             )
-            
+
             # Check solution status
             stats = self.solver.stats()
             if stats['return_status'] not in ['Solve_Succeeded', 'Solved_To_Acceptable_Level']:
                 print(f"Warning: Solver status: {stats['return_status']}")
-            
+
             # Extract solution
             x_opt = sol['x'].full().flatten()
-            
+
             # Extract control sequence
             u_optimal = []
             for i in range(self.horizon):
@@ -381,13 +379,13 @@ class BicycleMPCController:
                     # Last timestep only has u_k
                     idx = (self.horizon-1) * (self.num_controls + self.num_states) + \
                         (i - (self.horizon-1)) * self.num_controls
-                
+
                 # Extract controls for this timestep
                 u_i = x_opt[idx:idx+self.num_controls]
                 u_optimal.append(u_i)
-            
+
             return np.array(u_optimal)
-            
+
         except Exception as e:
             print(f"CasADi optimization failed: {e}")
             traceback.print_exc()
@@ -401,10 +399,10 @@ class BicycleMPCController:
         # Extract control values
         accel_cmd = u_optimal[0]  # Acceleration command
         steer = u_optimal[1]      # Steering angle
-        
+
         # Create CARLA control
         control = carla.VehicleControl()
-        
+
         # Convert acceleration to throttle/brake
         if accel_cmd >= 0:
             control.throttle = min(accel_cmd / self.max_accel, 1.0)
@@ -412,12 +410,12 @@ class BicycleMPCController:
         else:
             control.throttle = 0.0
             control.brake = min(-accel_cmd / self.min_accel, 1.0)
-        
+
         # Convert steering angle to CARLA steering [-1, 1]
         max_steering_angle = np.radians(69.99999237060547)  # CARLA max steering
         control.steer = steer / max_steering_angle
         control.steer = np.clip(control.steer, -1.0, 1.0)
-        
+
         return control
 
 class CarlaManager:
@@ -549,36 +547,36 @@ def run_simulation_with_casadi():
     Run the main simulation with bicycle model MPC controller
     """
     print("Starting simulation with bicycle model MPC controller...")
-    
+
     # Create CarlaManager instance
     carla_manager = CarlaManager()
     print("CarlaManager created")
-    
+
     preceding_vehicle_actor = None
     ego_vehicle_actor = None
-    
+
     try:
         # Spawn preceding vehicle
         preceding_vehicle_actor = carla_manager.spawn_vehicle(
             "vehicle.tesla.model3", SPAWN_LOCATION
         )
-        
+
         preceding_vehicle_actor.set_autopilot(False)
         time.sleep(1)  # allow vehicle to spawn
-        
+
         # Wrap with Vehicle class
         preceding_vehicle = Vehicle(preceding_vehicle_actor)
-        
+
         # Basic agent for preceding vehicle
         preceding_agent = BasicAgent(preceding_vehicle_actor, target_speed=PRECEDING_SPEED)  # 5 km/h
-        
-        
+
+
         # Set destination
         current_location = preceding_vehicle_actor.get_location()
         # Create a sequence of waypoints for the preceding vehicle to follow
         waypoints = []
         current_wp = carla_manager.map.get_waypoint(current_location, project_to_road=True)
-            
+
         # Get the next 20 waypoints, 5 meters apart
         next_wp = current_wp
         for _ in range(20):
@@ -592,31 +590,31 @@ def run_simulation_with_casadi():
         # Set the first waypoint as the initial destination
         if waypoints:
             preceding_agent.set_destination(waypoints[0])
-        
+
 
         # Spawn ego vehicle behind preceding vehicle
         spawn_loc_copy = SPAWN_LOCATION.copy()
         spawn_loc_copy[0] += 10  # 20 meters behind
         ego_vehicle_actor = carla_manager.spawn_vehicle("vehicle.tesla.model3", spawn_loc_copy)
-        
+
         if synchronous_mode:
             carla_manager.world.tick()
         else:
             time.sleep(1)
-        
+
         # Wrap with Vehicle class
         ego_vehicle = Vehicle(ego_vehicle_actor)
-        
+
         # Save spawn transform and initialize transformation matrices
         ego_vehicle.transform_to_spawn = ego_vehicle_actor.get_transform()
         world_to_ego, ego_to_world = ego_vehicle.get_transform_matrices()
-        
+
         # Create bicycle model MPC controller
         mpc_controller = BicycleMPCController(horizon=20, dt=dt, carla_manager=carla_manager)
-        
+
         # Target speed (m/s)
         target_speed = 20 / 3.6  # 20 km/h
-        
+
         # Main control loop
         try:
             print("Starting simulation with bicycle MPC. Press Ctrl+C to exit...")
@@ -646,7 +644,7 @@ def run_simulation_with_casadi():
                 else:
                     control_cmd.throttle = 0.0
                     control_cmd.brake = min(-PD_preceding_control, 1.0)
-                
+
                 # Apply another PD control for the steering angle to keep the preceding lane following
                 # get the error of the vehicle's heading compared to the road direction
                 road_wp = carla_manager.map.get_waypoint(current_preceding_location, project_to_road=True)
@@ -663,33 +661,33 @@ def run_simulation_with_casadi():
                 control_cmd.steer = control_steer
                 # Apply control to preceding vehicle
                 preceding_vehicle_actor.apply_control(control_cmd)
-                
+
                 # Get MPC control for ego vehicle
                 ego_control = mpc_controller.run_step(
                     ego_vehicle, preceding_vehicle, target_speed
                 )
-                
+
                 # Apply control to ego vehicle
                 ego_vehicle_actor.apply_control(ego_control)
-                                
+
                 # Advance simulation
                 carla_manager.world.tick()
-                
+
         except KeyboardInterrupt:
             print("\nSimulation terminated by user")
-    
+
     except Exception as e:
         print(f"Error during simulation: {e}")
         traceback.print_exc()
-    
+
     finally:
         # Clean up
         if preceding_vehicle_actor and preceding_vehicle_actor.is_alive:
             preceding_vehicle_actor.destroy()
-        
+
         if ego_vehicle_actor and ego_vehicle_actor.is_alive:
             ego_vehicle_actor.destroy()
-        
+
         if synchronous_mode:
             settings = carla_manager.world.get_settings()
             settings.synchronous_mode = False
