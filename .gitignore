@@ -2,4 +2,9 @@ agents/navigation/__pycache__/
 agents/tools/__pycache__/
 agents/llm/__pycache__/
 agents/__pycache__/
+*/__pycache__/*
 __pycache__/
+# Ignore VS Code folder
+.vscode/
+# Ignore all log.txt files
+*.txt
