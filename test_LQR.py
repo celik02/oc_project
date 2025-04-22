@@ -19,6 +19,8 @@ SPAWN_LOCATION = [
 
 # make the lqr has a longer horizon 
 lookahead_offset = 2 
+# safety distance:
+safe_distance = 8.0
 
 # synchronous_mode will make the simulation predictable
 synchronous_mode = False
@@ -299,10 +301,12 @@ def generate_overtake_waypoints(carla_manager, vehicle, direction="left",
     Returns:
         waypoints - List of carla.Waypoint objects forming the overtaking trajectory.
         locationPos - List only recording location points for LQR Controller
+        transitionIdx - List of tranistion points start and end. For gain schedule.
     """
     _map = carla_manager.map
     waypoints = []
     locationPos = []    
+    transitionIdx = []
 
     # 1. Start in current lane.
     current_wp = _map.get_waypoint(vehicle.get_location(), project_to_road=True)
@@ -328,6 +332,8 @@ def generate_overtake_waypoints(carla_manager, vehicle, direction="left",
         locationPos.append(curr_location)
 
         last_wp = next_wp
+    
+    transitionIdx.append(len(waypoints)-1)
 
     # 2. Change lane: get the adjacent lane from the last waypoint
     #if direction == "left":
@@ -354,6 +360,7 @@ def generate_overtake_waypoints(carla_manager, vehicle, direction="left",
     locationPos.extend(location_segment)
 
     last_wp = lane_change_segment[-1]
+    transitionIdx.append(len(waypoints)-1)
 
     # 3. Follow adjacent lane for overtaking distance.
     traveled = 0.0
@@ -370,6 +377,8 @@ def generate_overtake_waypoints(carla_manager, vehicle, direction="left",
         locationPos.append(curr_location)
 
         last_wp = next_wp
+
+    transitionIdx.append(len(waypoints)-1)
 
     # 4. Merge back to the original lane.
     # if direction == "left":
@@ -396,6 +405,7 @@ def generate_overtake_waypoints(carla_manager, vehicle, direction="left",
     locationPos.extend(location_segment)
 
     last_wp = lane_change_segment[-1]
+    transitionIdx.append(len(waypoints)-1)
 
     # 5. Follow the lane    
     traveled = 0.0
@@ -413,7 +423,7 @@ def generate_overtake_waypoints(carla_manager, vehicle, direction="left",
 
         last_wp = next_wp
 
-    return waypoints, locationPos
+    return waypoints, locationPos, transitionIdx
 
 def get_next_waypoint_from_list(waypoints, vehicle, current_index, threshold=2.0):
     """
@@ -469,30 +479,40 @@ def get_current_state(vehicle):
 
     return state_vec
 
-def LQR_Controller(x_cur, next_location, last_u, desired_vel = 30.0):
+def LQR_Controller(x_cur, location_points, lookahead_idx, last_u, desired_vel = 30.0, stage = "STRAIGHT"):
     """
     Parameters:
         x_cur: np.array([x, y, psi, v, a]) - vehicle current state
-        next_location: np.array([x, y, z]) - next target location
+        location_points: array of np.array([x, y, z]) - all location points
+        lookahead_idx: int - idx of the reference point in location_points
         last_u: p.array([delta, u_a]) - last control command
         desired_vel: float - desired velocity in km/h
+        stage: string - for gain schdule. psi low for straight line, psi high for tranistion line
 
     Returns:
         u_next: np.array([delta, u_a]) - next control command
         x_next: np.array - next state vector
-        x0: np.array - linearization center, just for debuging
+        x0: np.array - reference location points
     """
 
     # ===== 1. Construct linearization point (x0, u0) =====
     x0 = np.zeros(5)
     u0 = np.zeros(2)
+    next_location = location_points[lookahead_idx]
 
     x_target = next_location[0]
     y_target = next_location[1]
 
     x0[0] = x_target
     x0[1] = y_target
-    x0[2] = np.arctan2(y_target - x_cur[1], x_target - x_cur[0])  # safe heading
+    if lookahead_idx + 1 < len(location_points):
+        p0 = location_points[lookahead_idx]
+        p1 = location_points[lookahead_idx + 1]
+        dx = p1[0] - p0[0]
+        dy = p1[1] - p0[1]
+        x0[2] = math.atan2(dy, dx)
+    else:
+        x0[2] = x_cur[2]
     x0[3] = desired_vel * 5 / 18  # convert km/h to m/s
     x0[4] = 0  # assume steady state
 
@@ -501,10 +521,24 @@ def LQR_Controller(x_cur, next_location, last_u, desired_vel = 30.0):
 
     # Linearized system matrices
     A, B = vehicle_linear_dynamics(x0, u0)
+    # A, B = vehicle_linear_dynamics(x_cur, last_u)
 
     # ===== 2. Solve Continuous Algebraic Riccati Equation (CARE) =====
-    Q = np.diag([10, 6, 8, 10, 5])   # weight on state errors
-    R = np.diag([2, 1])              # weight on control effort
+    if stage == "STRAIGHT":
+        Q = np.diag([10, 8, 5, 10, 5])
+        R = np.diag([20, 1]) 
+    else:
+        Q = np.diag([10, 8, 7, 10, 7])   # weight on state errors
+        R = np.diag([12, 1])             # weight on control effort
+    
+    x_hat = x_cur - x0       # state deviation
+    x_hat[2] = wrap_to_pi(x_hat[2])     # make sure the angle difference is within (-pi ,pi)
+    
+    heading_err = abs(x_hat[2])     # penalise brakes more during large heading changes
+    if heading_err > np.deg2rad(8):
+        R[1,1] = 8.0
+    else:
+        R[1,1] = 1.0
 
     # Solve CARE: A'P + PA - PBR⁻¹B'P + Q = 0
     P = solve_continuous_are(A, B, Q, R)
@@ -513,11 +547,11 @@ def LQR_Controller(x_cur, next_location, last_u, desired_vel = 30.0):
     K = np.linalg.inv(R) @ B.T @ P
 
     # ===== 3. Feedback control =====
-    x_hat = x_cur - x0       # state deviation
-    x_hat[2] = wrap_to_pi(x_hat[2])     # make sure the angle difference is within (-pi ,pi)
     u_hat = -K @ x_hat       # control deviation from nominal
     u_next = u0 + u_hat      # actual control input
-    # u_next[0] = 0.5 * last_u[0] + 0.5 * u_next[0]
+    u_next[0] = np.clip(u_next[0], -0.4, 0.4)      # ±23°
+    u_next[1] = np.clip(u_next[1], -2.0, 2.0)      # throttle / brake
+    # u_next[0] = 0.7 * last_u[0] + 0.3 * u_next[0]
 
 
     # ===== 4. Update state =====
@@ -588,7 +622,7 @@ if __name__ == "__main__":
     time.sleep(1)  # allow the vehicle to spawn
     carla_manager.world.tick()
     # generate overtaking waypoints
-    waypoints, location_points = generate_overtake_waypoints(carla_manager, ego_vehicle,
+    waypoints, location_points, transitionIdx = generate_overtake_waypoints(carla_manager, ego_vehicle,
                                             direction="left",
                                             distance_current_lane=10.0,
                                             lane_change_step=1.0,
@@ -600,6 +634,8 @@ if __name__ == "__main__":
 
     current_wp_index = 0
     u_next = np.zeros(2)
+    stage = "STRAIGHT"
+    desired_vel = 20.0
 
     try:
         # main loop:
@@ -611,11 +647,24 @@ if __name__ == "__main__":
             next_overtake_wp, current_wp_index = get_next_waypoint_from_list(waypoints, ego_vehicle, current_wp_index, threshold=2.0)
             lookahead_idx = min(current_wp_index + lookahead_offset, len(location_points)-1)
             next_overtake_location = location_points[lookahead_idx]
-            next_overtake_location = location_points[current_wp_index]
+            # next_overtake_location = location_points[current_wp_index]
             # Get current state
             x_cur = get_current_state(ego_vehicle)
+
             # Get control w.r.t. next_wp and current state
-            u_next, x_next, x0 = LQR_Controller(x_cur, next_overtake_location, u_next, 20)     # desired velocity as 20 km/h
+            if (lookahead_idx == transitionIdx[0]) or (lookahead_idx == transitionIdx[2]):  # start tranistion
+                stage = "TRANSITION"
+            elif (lookahead_idx == transitionIdx[1]) or (lookahead_idx == transitionIdx[3]):    # start straight
+                stage = "STRAIGHT"
+
+            dist = abs(ego_vehicle.get_location().x - preceding_vehicle.get_location().x)
+            lateral_dis = abs(ego_vehicle.get_location().y - preceding_vehicle.get_location().y)
+            if dist < safe_distance and lateral_dis < 1.0 and lookahead_idx < transitionIdx[0]:
+                desired_vel = 10.0  
+            else:
+                desired_vel = 20.0
+
+            u_next, x_next, x0 = LQR_Controller(x_cur, location_points, lookahead_idx, u_next, desired_vel, stage)     # desired velocity as 20 km/h
 
             control = convert2Carla(u_next)
             ego_vehicle.apply_control(control)
@@ -629,11 +678,13 @@ if __name__ == "__main__":
 
             log_both("=" * 50, log_file)
             log_both(f"x_cur: x = {x_cur[0]:.2f}, y = {x_cur[1]:.2f}, ψ = {np.degrees(x_cur[2]):.1f}°, v = {x_cur[3]:.2f} m/s", log_file)
-            log_both(f"lqr linearization center: x = {x0[0]:.2f}, y = {x0[1]:.2f}, ψ = {np.degrees(x0[2]):.1f}°", log_file)
-            log_both(f"target: x = {x0[0]:.2f}, y = {x0[1]:.2f}, ψ = {np.degrees(x0[2]):.1f}°", log_file)
-            log_both(f"x_next: x = {next_overtake_location[0]:.2f}, y = {next_overtake_location[1]:.2f} ", log_file)
-            log_both(f"index: {current_wp_index}", log_file)
-            log_both(f"error: dx = {x_cur[0] - next_overtake_location[0]:.2f}, dy = {x_cur[1] - next_overtake_location[1]:.2f}", log_file)
+            # log_both(f"lqr linearization center: x = {x0[0]:.2f}, y = {x0[1]:.2f}, ψ = {np.degrees(x0[2]):.1f}°", log_file)
+            log_both(f"target (linearization center): x = {x0[0]:.2f}, y = {x0[1]:.2f}, ψ = {np.degrees(x0[2]):.1f}°", log_file)
+            log_both(f"x_next: x = {x_next[0]:.2f}, y = {x_next[1]:.2f}, ψ = {np.degrees(x_next[2]):.1f}°", log_file)
+            log_both(f"distance to the leading vehicle: {dist}, lateral distance: {lateral_dis}, current desired vel: {desired_vel* 5 / 18}", log_file)
+            log_both(f"index: {lookahead_idx}, current stage: {stage}", log_file)
+            dpsi = wrap_to_pi(x_cur[2] - x0[2])
+            log_both(f"error: dx = {x_cur[0] - next_overtake_location[0]:.2f}, dy = {x_cur[1] - next_overtake_location[1]:.2f}, dpsi = {np.degrees(dpsi):.1f}", log_file)
             log_both("=" * 50, log_file)
             
             v1 = preceding_vehicle.get_velocity()
