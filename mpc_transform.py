@@ -573,7 +573,7 @@ def run_simulation_with_casadi():
         preceding_vehicle = Vehicle(preceding_vehicle_actor)
 
         # Basic agent for preceding vehicle
-        preceding_agent = BasicAgent(preceding_vehicle_actor, target_speed=PRECEDING_SPEED)  # 5 km/h
+        preceding_agent = BasicAgent(preceding_vehicle_actor, target_speed=PRECEDING_SPEED) 
 
 
         # Set destination
