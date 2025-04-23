@@ -8,6 +8,8 @@ import numpy as np
 from scipy.linalg import solve_continuous_are
 import math
 import atexit
+import traceback
+
 
 
 dt = 0.1  # seconds
@@ -23,7 +25,7 @@ lookahead_offset = 2
 safe_distance = 8.0
 
 # synchronous_mode will make the simulation predictable
-synchronous_mode = False
+synchronous_mode = True
 
 def log_both(msg, log_file):
     """
@@ -601,102 +603,115 @@ if __name__ == "__main__":
 
     carla_manager = CarlaManager()
     print("CarlaManager is created")
-    preceding_vehicle = carla_manager.spawn_vehicle("vehicle.tesla.model3", SPAWN_LOCATION)
-    preceding_vehicle.set_autopilot(False)
-    time.sleep(1)  # allow the vehicle to spawn
-    carla_manager.world.tick()
-    # start autopilot controller for preciding vehicle
-    agent = BasicAgent(preceding_vehicle, target_speed=10)
-    # set destination for the preceding vehicle
-    current_location = preceding_vehicle.get_location()
-    current_wp = carla_manager.map.get_waypoint(current_location, project_to_road=True)
-    next_wps = current_wp.next(100.0)  
-    if next_wps:  # if there is a waypoint ahead
-        destination = next_wps[0].transform.location
-    else:
-        destination = current_location
-    agent.set_destination(destination)  # choose a destination appropriately
-    # spawn ego vehicle
-    SPAWN_LOCATION[0] += 20
-    ego_vehicle = carla_manager.spawn_vehicle("vehicle.tesla.model3", SPAWN_LOCATION)
-    time.sleep(1)  # allow the vehicle to spawn
-    carla_manager.world.tick()
-    # generate overtaking waypoints
-    waypoints, location_points, transitionIdx = generate_overtake_waypoints(carla_manager, ego_vehicle,
-                                            direction="left",
-                                            distance_current_lane=10.0,
-                                            lane_change_step=1.0,
-                                            overtake_distance=40.0,
-                                            merge_distance=20.0)
-    # For debugging, you can visualize the waypoints:
-    # carla_manager.debug_waypoints(waypoints)
-    carla_manager.debug_np_locations(location_points)
-
-    current_wp_index = 0
-    u_next = np.zeros(2)
-    stage = "STRAIGHT"
-    desired_vel = 25.0
-
     try:
-        # main loop:
-        while True:
-            # Control for the preceding vehicle
-            control_cmd = agent.run_step()
-            preceding_vehicle.apply_control(control_cmd)
-            # LQR for the ego vehicle
-            next_overtake_wp, current_wp_index = get_next_waypoint_from_list(waypoints, ego_vehicle, current_wp_index, threshold=2.0)
-            lookahead_idx = min(current_wp_index + lookahead_offset, len(location_points)-1)
-            next_overtake_location = location_points[lookahead_idx]
-            # next_overtake_location = location_points[current_wp_index]
-            # Get current state
-            x_cur = get_current_state(ego_vehicle)
+        preceding_vehicle = carla_manager.spawn_vehicle("vehicle.tesla.model3", SPAWN_LOCATION)
+        preceding_vehicle.set_autopilot(False)
+        time.sleep(1)  # allow the vehicle to spawn
+        carla_manager.world.tick()
+        # start autopilot controller for preciding vehicle
+        agent = BasicAgent(preceding_vehicle, target_speed=10)
+        # set destination for the preceding vehicle
+        current_location = preceding_vehicle.get_location()
+        current_wp = carla_manager.map.get_waypoint(current_location, project_to_road=True)
+        next_wps = current_wp.next(100.0)  
+        if next_wps:  # if there is a waypoint ahead
+            destination = next_wps[0].transform.location
+        else:
+            destination = current_location
+        agent.set_destination(destination)  # choose a destination appropriately
+        # spawn ego vehicle
+        SPAWN_LOCATION[0] += 20
+        ego_vehicle = carla_manager.spawn_vehicle("vehicle.tesla.model3", SPAWN_LOCATION)
+        time.sleep(1)  # allow the vehicle to spawn
+        carla_manager.world.tick()
+        # generate overtaking waypoints
+        waypoints, location_points, transitionIdx = generate_overtake_waypoints(carla_manager, ego_vehicle,
+                                                direction="left",
+                                                distance_current_lane=10.0,
+                                                lane_change_step=1.0,
+                                                overtake_distance=40.0,
+                                                merge_distance=100.0)
+        # For debugging, you can visualize the waypoints:
+        # carla_manager.debug_waypoints(waypoints)
+        carla_manager.debug_np_locations(location_points)
 
-            # Get control w.r.t. next_wp and current state
-            if (lookahead_idx == transitionIdx[0]) or (lookahead_idx == transitionIdx[2]):  # start tranistion
-                stage = "TRANSITION"
-            elif (lookahead_idx == transitionIdx[1]) or (lookahead_idx == transitionIdx[3]):    # start straight
-                stage = "STRAIGHT"
+        current_wp_index = 0
+        u_next = np.zeros(2)
+        stage = "STRAIGHT"
+        desired_vel = 25.0
 
-            dist = abs(ego_vehicle.get_location().x - preceding_vehicle.get_location().x)
-            lateral_dis = abs(ego_vehicle.get_location().y - preceding_vehicle.get_location().y)
-            if dist < safe_distance and lateral_dis < 1.0 and lookahead_idx < transitionIdx[0]:
-                desired_vel = 15.0  
-            else:
-                desired_vel = 25.0
+        try:
+            # main loop:
+            while True:
 
-            u_next, x_next, x0 = LQR_Controller(x_cur, location_points, lookahead_idx, u_next, desired_vel, stage)     # desired velocity as 20 km/h
+                # Initialize data collection
+                import os
+                from datetime import datetime
+                os.makedirs('results', exist_ok=True)
+                simulation_data = []
+                initial_transform = ego_vehicle.get_transform()
+                sim_time = 0.0
 
-            control = convert2Carla(u_next)
-            ego_vehicle.apply_control(control)
-            carla_manager.world.tick()
-            time.sleep(0.05)
+                # Control for the preceding vehicle
+                control_cmd = agent.run_step()
+                preceding_vehicle.apply_control(control_cmd)
+                # LQR for the ego vehicle
+                next_overtake_wp, current_wp_index = get_next_waypoint_from_list(waypoints, ego_vehicle, current_wp_index, threshold=2.0)
+                lookahead_idx = min(current_wp_index + lookahead_offset, len(location_points)-1)
+                next_overtake_location = location_points[lookahead_idx]
+                # next_overtake_location = location_points[current_wp_index]
+                # Get current state
+                x_cur = get_current_state(ego_vehicle)
 
-            #### Debug
-            # print(f"x_curr: {x_cur[0]:.2f}, {x_cur[1]:.2f}")
-            # print(f"next_overtake_loc: {next_overtake_location[0]:.2f}, {next_overtake_location[1]:.2f}")
-            # print(f"x_next: {x_next[0]:.2f}, {x_next[1]:.2f}", "idx is: ", current_wp_index)
+                # Get control w.r.t. next_wp and current state
+                if (lookahead_idx == transitionIdx[0]) or (lookahead_idx == transitionIdx[2]):  # start tranistion
+                    stage = "TRANSITION"
+                elif (lookahead_idx == transitionIdx[1]) or (lookahead_idx == transitionIdx[3]):    # start straight
+                    stage = "STRAIGHT"
 
-            log_both("=" * 50, log_file)
-            log_both(f"x_cur: x = {x_cur[0]:.2f}, y = {x_cur[1]:.2f}, ψ = {np.degrees(x_cur[2]):.1f}°, v = {x_cur[3]:.2f} m/s", log_file)
-            # log_both(f"lqr linearization center: x = {x0[0]:.2f}, y = {x0[1]:.2f}, ψ = {np.degrees(x0[2]):.1f}°", log_file)
-            log_both(f"target (linearization center): x = {x0[0]:.2f}, y = {x0[1]:.2f}, ψ = {np.degrees(x0[2]):.1f}°", log_file)
-            log_both(f"x_next: x = {x_next[0]:.2f}, y = {x_next[1]:.2f}, ψ = {np.degrees(x_next[2]):.1f}°", log_file)
-            log_both(f"distance to the leading vehicle: {dist}, lateral distance: {lateral_dis}, current desired vel: {desired_vel* 5 / 18}", log_file)
-            log_both(f"index: {lookahead_idx}, current stage: {stage}", log_file)
-            dpsi = wrap_to_pi(x_cur[2] - x0[2])
-            log_both(f"error: dx = {x_cur[0] - next_overtake_location[0]:.2f}, dy = {x_cur[1] - next_overtake_location[1]:.2f}, dpsi = {np.degrees(dpsi):.1f}", log_file)
-            log_both("=" * 50, log_file)
-            
-            v1 = preceding_vehicle.get_velocity()
-            v2 = ego_vehicle.get_velocity()
-            speed1 = 3.6 * (v1.x**2 + v1.y**2 + v1.z**2)**0.5  # km/h
-            speed2 = 3.6 * (v2.x**2 + v2.y**2 + v2.z**2)**0.5
-            # print(f"[EGO CONTROL] throttle: {control.throttle:.2f}, steer: {control.steer:.2f}, brake: {control.brake:.2f}")
-            # print(f"Preceding speed: {speed1:.2f} km/h | Ego speed: {speed2:.2f} km/h")
+                dist = abs(ego_vehicle.get_location().x - preceding_vehicle.get_location().x)
+                lateral_dis = abs(ego_vehicle.get_location().y - preceding_vehicle.get_location().y)
+                if dist < safe_distance and lateral_dis < 1.0 and lookahead_idx < transitionIdx[0]:
+                    desired_vel = 15.0  
+                else:
+                    desired_vel = 25.0
 
-    except KeyboardInterrupt:
+                u_next, x_next, x0 = LQR_Controller(x_cur, location_points, lookahead_idx, u_next, desired_vel, stage)     # desired velocity as 20 km/h
+
+                control = convert2Carla(u_next)
+                ego_vehicle.apply_control(control)
+                carla_manager.world.tick()
+                time.sleep(0.05)
+
+                log_both("=" * 50, log_file)
+                log_both(f"x_cur: x = {x_cur[0]:.2f}, y = {x_cur[1]:.2f}, ψ = {np.degrees(x_cur[2]):.1f}°, v = {x_cur[3]:.2f} m/s", log_file)
+                # log_both(f"lqr linearization center: x = {x0[0]:.2f}, y = {x0[1]:.2f}, ψ = {np.degrees(x0[2]):.1f}°", log_file)
+                log_both(f"target (linearization center): x = {x0[0]:.2f}, y = {x0[1]:.2f}, ψ = {np.degrees(x0[2]):.1f}°", log_file)
+                log_both(f"x_next: x = {x_next[0]:.2f}, y = {x_next[1]:.2f}, ψ = {np.degrees(x_next[2]):.1f}°", log_file)
+                log_both(f"distance to the leading vehicle: {dist}, lateral distance: {lateral_dis}, current desired vel: {desired_vel* 5 / 18}", log_file)
+                log_both(f"index: {lookahead_idx}, current stage: {stage}", log_file)
+                dpsi = wrap_to_pi(x_cur[2] - x0[2])
+                log_both(f"error: dx = {x_cur[0] - next_overtake_location[0]:.2f}, dy = {x_cur[1] - next_overtake_location[1]:.2f}, dpsi = {np.degrees(dpsi):.1f}", log_file)
+                log_both("=" * 50, log_file)
+
+        except KeyboardInterrupt:
+            carla_manager.__del__()
+            print("\nSimulation terminated by user")
+
+    except Exception as e:
+        print(f"Error during simulation: {e}")
+        traceback.print_exc()
+
+    finally:
+        if preceding_vehicle is not None:
+            preceding_vehicle.destroy()
+        if ego_vehicle is not None:
+            ego_vehicle.destroy()
         carla_manager.__del__()
-        print('Closing Carla')
+        log_both("==== LQR Tracking Log End ====", log_file)
+        log_file.close()
+        print("Simulation completed and log file closed.")
+    
 
 
 

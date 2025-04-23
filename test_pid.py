@@ -23,7 +23,7 @@ lookahead_offset = 2
 safe_distance = 8.0
 
 # synchronous_mode will make the simulation predictable
-synchronous_mode = False
+synchronous_mode = True
 
 def log_both(msg, log_file):
     """

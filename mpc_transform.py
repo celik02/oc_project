@@ -133,7 +133,7 @@ class BicycleMPCController:
         # Convert to CARLA control
         control = self.convert_to_control(u_optimal[0])
 
-        return control
+        return control, u_optimal
 
     def predict_vehicle_trajectory(self, position, speed, heading=0.0):
         """
@@ -362,13 +362,13 @@ class BicycleMPCController:
             # Check solution status
             stats = self.solver.stats()
             if stats['return_status'] not in ['Solve_Succeeded', 'Solved_To_Acceptable_Level']:
-                print(f"Warning: Solver status: {stats['return_status']}")
+                # print(f"Warning: Solver status: {stats['return_status']}")
                 # Return zero steering and negative acceleration as fallback
                 control = np.zeros((self.horizon, self.num_controls))
                 control[:, 0] = self.min_accel / 100  # Negative acceleration
                 return control
-            else:
-                print(f"Solver succeeded: {stats['return_status']}")
+            # else:
+            #     print(f"Solver succeeded: {stats['return_status']}")
 
             # Extract solution
             x_opt = sol['x'].full().flatten()
@@ -668,17 +668,81 @@ def run_simulation_with_casadi():
                 preceding_vehicle_actor.apply_control(control_cmd)
 
                 # Get MPC control for ego vehicle
-                ego_control = mpc_controller.run_step(
+                ego_control, u_optimal = mpc_controller.run_step(
                     ego_vehicle, preceding_vehicle, target_speed
                 )
 
                 # Apply control to ego vehicle
                 ego_vehicle_actor.apply_control(ego_control)
+                
+                # Save the state and control input as a csv file for plotting later
+                # Initialize data collection if first iteration
+                if not hasattr(run_simulation_with_casadi, 'simulation_data'):
+                    run_simulation_with_casadi.simulation_data = []
+                    run_simulation_with_casadi.sim_time = 0.0
+                    import os
+                    os.makedirs('results', exist_ok=True)
+                    print("Data collection initialized in ego coordinate frame")
+
+                # Update simulation time
+                run_simulation_with_casadi.sim_time += dt
+
+                # Get ego vehicle state in ego coordinates [x, y, psi, v, a]
+                ego_state = ego_vehicle.get_vehicle_state()
+
+                # Get preceding vehicle position in ego coordinates
+                preceding_location = preceding_vehicle.actor.get_location()
+                preceding_pos_in_ego = ego_vehicle.world_to_ego_coordinates(preceding_location)
+
+                # Extract MPC control commands
+                # The raw output from the MPC solver contains acceleration and steering commands
+                mpc_accel_cmd = u_optimal[0][0] if len(u_optimal) > 0 else 0
+                mpc_steer_cmd = u_optimal[0][1] if len(u_optimal) > 0 else 0
+
+                # Create data record in ego coordinate frame
+                data_point = {
+                    'time': run_simulation_with_casadi.sim_time,
+                    'ego_x': ego_state[0],  # x-position in ego frame
+                    'ego_y': ego_state[1],  # y-position in ego frame
+                    'ego_heading': ego_state[2],  # heading in ego frame
+                    'ego_speed': ego_state[3],  # speed
+                    'ego_accel': ego_state[4],  # acceleration
+                    'preceding_x': preceding_pos_in_ego[0],  # x-position in ego frame
+                    'preceding_y': preceding_pos_in_ego[1],  # y-position in ego frame
+                    'control_throttle': ego_control.throttle,
+                    'control_brake': ego_control.brake,
+                    'control_steer': ego_control.steer,
+                    'mpc_accel_cmd': mpc_accel_cmd,
+                    'mpc_steer_cmd': mpc_steer_cmd
+                }
+
+                # Append to data collection
+                run_simulation_with_casadi.simulation_data.append(data_point)
+
+                # Check if target position reached (100m in ego x-direction)
+                if ego_state[0] >= 100:
+                    print(f"Target position reached at {ego_state[0]:.2f}m in ego frame. Ending simulation.")
+                    
+                    # Save data to CSV
+                    import csv
+                    from datetime import datetime
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    csv_filename = f'results/overtaking_simulation_{timestamp}.csv'
+                    
+                    with open(csv_filename, 'w', newline='') as csvfile:
+                        writer = csv.DictWriter(csvfile, fieldnames=data_point.keys())
+                        writer.writeheader()
+                        for data_row in run_simulation_with_casadi.simulation_data:
+                            writer.writerow(data_row)
+                    
+                    print(f"Data saved to {csv_filename}")
+                    break
 
                 # Advance simulation
                 carla_manager.world.tick()
 
         except KeyboardInterrupt:
+            carla_manager.__del__()
             print("\nSimulation terminated by user")
 
     except Exception as e:
@@ -686,7 +750,7 @@ def run_simulation_with_casadi():
         traceback.print_exc()
 
     finally:
-        # Clean up
+        # Clean up actors
         if preceding_vehicle_actor and preceding_vehicle_actor.is_alive:
             preceding_vehicle_actor.destroy()
 
@@ -697,6 +761,24 @@ def run_simulation_with_casadi():
             settings = carla_manager.world.get_settings()
             settings.synchronous_mode = False
             carla_manager.world.apply_settings(settings)
+            
+        # Save collected data to CSV if simulation was interrupted
+        if hasattr(run_simulation_with_casadi, 'simulation_data') and run_simulation_with_casadi.simulation_data:
+            import csv
+            import os
+            from datetime import datetime
+            
+            os.makedirs('results', exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            csv_filename = f'results/overtaking_simulation_{timestamp}.csv'
+            
+            with open(csv_filename, 'w', newline='') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=run_simulation_with_casadi.simulation_data[0].keys())
+                writer.writeheader()
+                for data_row in run_simulation_with_casadi.simulation_data:
+                    writer.writerow(data_row)
+            
+            print(f"Simulation data saved to {csv_filename}")
 
 
 if __name__ == "__main__":
