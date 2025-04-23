@@ -8,6 +8,11 @@ import numpy as np
 from scipy.linalg import solve_continuous_are
 import math
 import atexit
+import traceback
+from vehicle import Vehicle  # custom vehicle class to handle transformations
+import csv
+import os
+from datetime import datetime
 
 
 dt = 0.1  # seconds
@@ -335,25 +340,7 @@ def generate_overtake_waypoints(carla_manager, vehicle, direction="left",
     
     transitionIdx.append(len(waypoints)-1)
 
-    # 2. Change lane: get the adjacent lane from the last waypoint
-    #if direction == "left":
-    #    adjacent_wp = last_wp.get_left_lane()
-    #    # next_adjacent_wp = adjacent_wp.next(lane_change_step)
-    #    # next_adjacent_wp =next_adjacent_wp[0]
-    #else:
-    #    adjacent_wp = last_wp.get_right_lane()
-    #    # next_adjacent_wp = adjacent_wp.next(lane_change_step)
-    #    # next_adjacent_wp =next_adjacent_wp[0]
-#
-    #if adjacent_wp is None:
-    #    print("No adjacent lane available in direction", direction)
-    #    return waypoints
-#
-    #waypoints.append(adjacent_wp)
-    #last_wp = adjacent_wp
-    ## waypoints.append(next_adjacent_wp)
-    ## last_wp = next_adjacent_wp
-
+    # 2. Change lane
     lane_change_segment, location_segment = generate_lane_change_segment(last_wp, _map, direction)
 
     waypoints.extend(lane_change_segment)
@@ -381,21 +368,6 @@ def generate_overtake_waypoints(carla_manager, vehicle, direction="left",
     transitionIdx.append(len(waypoints)-1)
 
     # 4. Merge back to the original lane.
-    # if direction == "left":
-    #     merging_wp = last_wp.get_right_lane()
-    #     # next_merging_wp = merging_wp.next(lane_change_step)
-    #     # next_merging_wp = next_merging_wp[0]
-    # else:
-    #     merging_wp = last_wp.get_left_lane()
-    #     # next_merging_wp = merging_wp.next(lane_change_step)
-    #     # next_merging_wp = next_merging_wp[0]
-# 
-    # if merging_wp is not None:
-    #     waypoints.append(merging_wp)
-    #     last_wp = merging_wp
-    #     # waypoints.append(next_merging_wp)
-    #     # last_wp = next_merging_wp
-
     if direction == "left":
         lane_change_segment, location_segment = generate_lane_change_segment(last_wp, _map, "right")
     else:
@@ -479,93 +451,12 @@ def get_current_state(vehicle):
 
     return state_vec
 
-def LQR_Controller(x_cur, location_points, lookahead_idx, last_u, desired_vel = 30.0, stage = "STRAIGHT"):
-    """
-    Parameters:
-        x_cur: np.array([x, y, psi, v, a]) - vehicle current state
-        location_points: array of np.array([x, y, z]) - all location points
-        lookahead_idx: int - idx of the reference point in location_points
-        last_u: p.array([delta, u_a]) - last control command
-        desired_vel: float - desired velocity in km/h
-        stage: string - for gain schdule. psi low for straight line, psi high for tranistion line
-
-    Returns:
-        u_next: np.array([delta, u_a]) - next control command
-        x_next: np.array - next state vector
-        x0: np.array - reference location points
-    """
-
-    # ===== 1. Construct linearization point (x0, u0) =====
-    x0 = np.zeros(5)
-    u0 = np.zeros(2)
-    next_location = location_points[lookahead_idx]
-
-    x_target = next_location[0]
-    y_target = next_location[1]
-
-    x0[0] = x_target
-    x0[1] = y_target
-    if lookahead_idx + 1 < len(location_points):
-        p0 = location_points[lookahead_idx]
-        p1 = location_points[lookahead_idx + 1]
-        dx = p1[0] - p0[0]
-        dy = p1[1] - p0[1]
-        x0[2] = math.atan2(dy, dx)
-    else:
-        x0[2] = x_cur[2]
-    x0[3] = desired_vel * 5 / 18  # convert km/h to m/s
-    x0[4] = 0  # assume steady state
-
-    u0[0] = 0  # nominal steering (can be refined)
-    u0[1] = 0  # nominal acceleration input
-
-    # Linearized system matrices
-    A, B = vehicle_linear_dynamics(x0, u0)
-    # A, B = vehicle_linear_dynamics(x_cur, last_u)
-
-    # ===== 2. Solve Continuous Algebraic Riccati Equation (CARE) =====
-    if stage == "STRAIGHT":
-        Q = np.diag([10, 8, 5, 10, 5])
-        R = np.diag([20, 1]) 
-    else:
-        Q = np.diag([10, 8, 7, 10, 7])   # weight on state errors
-        R = np.diag([12, 1])             # weight on control effort
-    
-    x_hat = x_cur - x0       # state deviation
-    x_hat[2] = wrap_to_pi(x_hat[2])     # make sure the angle difference is within (-pi ,pi)
-    
-    heading_err = abs(x_hat[2])     # penalise brakes more during large heading changes
-    if heading_err > np.deg2rad(8):
-        R[1,1] = 8.0
-    else:
-        R[1,1] = 1.0
-
-    # Solve CARE: A'P + PA - PBR⁻¹B'P + Q = 0
-    P = solve_continuous_are(A, B, Q, R)
-
-    # Compute gain matrix: K = R⁻¹ Bᵀ P
-    K = np.linalg.inv(R) @ B.T @ P
-
-    # ===== 3. Feedback control =====
-    u_hat = -K @ x_hat       # control deviation from nominal
-    u_next = u0 + u_hat      # actual control input
-    u_next[0] = np.clip(u_next[0], -0.4, 0.4)      # ±23°
-    u_next[1] = np.clip(u_next[1], -2.0, 2.0)      # throttle / brake
-    # u_next[0] = 0.7 * last_u[0] + 0.3 * u_next[0]
-
-
-    # ===== 4. Update state =====
-    dxdt = nonlinear_dynamics(x_cur, u_next)
-    x_next = x_cur + dt * dxdt
-
-    return u_next, x_next, x0
-
 def convert2Carla(u_next, max_steer=0.4, max_accel=3.0, max_decel=5.0):
     """
-    Convert LQR controller output to carla.VehicleControl()
+    Convert controller output to carla.VehicleControl()
 
     Parameters:
-    - u_next: np.array([delta, u_a]) -- LQR controller output 
+    - u_next: np.array([delta, u_a]) -- Controller output 
     - max_steer: maximum steering angle in radians (used for normalization)
     - max_accel: maximum throttle acceleration (m/s^2)
     - max_decel: maximum brake deceleration (m/s^2)
@@ -597,153 +488,232 @@ if __name__ == "__main__":
     # Debug
     log_file = open("pid_tracking_log.txt", "w")
     atexit.register(log_file.close)
-    log_file.write("==== pid Tracking Log Start ====\n")
+    log_file.write("==== PID Tracking Log Start ====\n")
 
     carla_manager = CarlaManager()
     print("CarlaManager is created")
-    preceding_vehicle = carla_manager.spawn_vehicle("vehicle.tesla.model3", SPAWN_LOCATION)
-    preceding_vehicle.set_autopilot(False)
-    time.sleep(1)  # allow the vehicle to spawn
-    carla_manager.world.tick()
-    # start autopilot controller for preciding vehicle
-    agent = BasicAgent(preceding_vehicle, target_speed=10)
-    # set destination for the preceding vehicle
-    current_location = preceding_vehicle.get_location()
-    current_wp = carla_manager.map.get_waypoint(current_location, project_to_road=True)
-    next_wps = current_wp.next(100.0)  
-    if next_wps:  # if there is a waypoint ahead
-        destination = next_wps[0].transform.location
-    else:
-        destination = current_location
-    agent.set_destination(destination)  # choose a destination appropriately
-    # spawn ego vehicle
-    SPAWN_LOCATION[0] += 20
-    ego_vehicle = carla_manager.spawn_vehicle("vehicle.tesla.model3", SPAWN_LOCATION)
-    time.sleep(1)  # allow the vehicle to spawn
-    carla_manager.world.tick()
-    # generate overtaking waypoints
-    waypoints, location_points, transitionIdx = generate_overtake_waypoints(carla_manager, ego_vehicle,
-                                            direction="left",
-                                            distance_current_lane=10.0,
-                                            lane_change_step=1.0,
-                                            overtake_distance=40.0,
-                                            merge_distance=20.0)
-    # For debugging, you can visualize the waypoints:
-    # carla_manager.debug_waypoints(waypoints)
-    carla_manager.debug_np_locations(location_points)
-
-    current_wp_index = 0
-    u_next = np.zeros(2)
-    stage = "STRAIGHT"
-    desired_vel = 25.0 * 5 / 18 # desired velocity in m/s
-
-
-    kp_dist = 0.1  # Proportional gain for distance control
-    kp_dist_lateral = 1.0  # Proportional gain for lateral distance control
-    kp_vel = 0.5  # Proportional gain for velocity control
-    kd_dist = 0.2  # Derivative gain for distance control
-    kd_dist_lateral = 0.3  # Derivative gain for lateral distance control
-    kd_vel = 0.1  # Derivative gain for velocity control
-    ki_dist = 0.00  # Integral gain for distance control
-    ki_dist_lateral = 0.00  # Integral gain for lateral distance control
-    ki_vel = 0.00  # Integral gain for velocity control
-
-    prev_dist = 0.0  # Previous distance to the leading vehicle
-    prev_lateral_dist = 0.0  # Previous lateral distance to the leading vehicle
-    prev_vel = 0.0  # Previous velocity of the ego vehicle
-
-    dist_sum = 0.0  # Integral term for distance control
-    lateral_dist_sum = 0.0  # Integral term for lateral distance control
-    vel_sum = 0.0  # Integral term for velocity control
-
     try:
+        preceding_vehicle_actor = carla_manager.spawn_vehicle("vehicle.tesla.model3", SPAWN_LOCATION)
+        preceding_vehicle_actor.set_autopilot(False)
+        time.sleep(1)  # allow the vehicle to spawn
+        carla_manager.world.tick()
         
-        # main loop:
-        while True:
-            # Control for the preceding vehicle
-            control_cmd = agent.run_step()
-            preceding_vehicle.apply_control(control_cmd)
-            # LQR for the ego vehicle
-            next_overtake_wp, current_wp_index = get_next_waypoint_from_list(waypoints, ego_vehicle, current_wp_index, threshold=4.0)
-            lookahead_idx = min(current_wp_index + lookahead_offset, len(location_points)-1)
-            next_overtake_location = location_points[lookahead_idx]
-            # next_overtake_location = location_points[current_wp_index]
-            # Get current state
-            x_cur = get_current_state(ego_vehicle)
+        # Wrap with Vehicle class
+        preceding_vehicle = Vehicle(preceding_vehicle_actor)
+        
+        # start autopilot controller for preceding vehicle
+        agent = BasicAgent(preceding_vehicle_actor, target_speed=10)
+        # set destination for the preceding vehicle
+        current_location = preceding_vehicle_actor.get_location()
+        current_wp = carla_manager.map.get_waypoint(current_location, project_to_road=True)
+        next_wps = current_wp.next(100.0)  
+        if next_wps:  # if there is a waypoint ahead
+            destination = next_wps[0].transform.location
+        else:
+            destination = current_location
+        agent.set_destination(destination)  # choose a destination appropriately
+        
+        # spawn ego vehicle
+        SPAWN_LOCATION[0] += 20
+        ego_vehicle_actor = carla_manager.spawn_vehicle("vehicle.tesla.model3", SPAWN_LOCATION)
+        time.sleep(1)  # allow the vehicle to spawn
+        carla_manager.world.tick()
+        
+        # Wrap with Vehicle class
+        ego_vehicle = Vehicle(ego_vehicle_actor)
+        
+        # Save spawn transform and initialize transformation matrices
+        ego_vehicle.transform_to_spawn = ego_vehicle_actor.get_transform()
+        world_to_ego, ego_to_world = ego_vehicle.get_transform_matrices()
+        
+        # generate overtaking waypoints
+        waypoints, location_points, transitionIdx = generate_overtake_waypoints(carla_manager, ego_vehicle_actor,
+                                                direction="left",
+                                                distance_current_lane=10.0,
+                                                lane_change_step=1.0,
+                                                overtake_distance=40.0,
+                                                merge_distance=100.0)
+        # For debugging, you can visualize the waypoints:
+        carla_manager.debug_np_locations(location_points)
 
-            # # Get control w.r.t. next_wp and current state
-            # if (lookahead_idx == transitionIdx[0]) or (lookahead_idx == transitionIdx[2]):  # start tranistion
-            #     stage = "TRANSITION"
-            # elif (lookahead_idx == transitionIdx[1]) or (lookahead_idx == transitionIdx[3]):    # start straight
-            #     stage = "STRAIGHT"
+        current_wp_index = 0
+        u_next = np.zeros(2)
+        stage = "STRAIGHT"
+        desired_vel = 25.0 * 5 / 18  # desired velocity in m/s
 
-            # x = ego_vehicle.get_location().x - preceding_vehicle.get_location().x
-            # y = ego_vehicle.get_location().y - preceding_vehicle.get_location().y
-            # if abs(x) < safe_distance and abs(y) < 1.0 and lookahead_idx < transitionIdx[0]:
-            #     desired_vel = 10.0  
-            # else:
-            #     desired_vel = 20.0
+        # PID control parameters
+        kp_dist = 0.1  # Proportional gain for distance control
+        kp_dist_lateral = 1.0  # Proportional gain for lateral distance control
+        kp_vel = 0.5  # Proportional gain for velocity control
+        kd_dist = 0.2  # Derivative gain for distance control
+        kd_dist_lateral = 0.3  # Derivative gain for lateral distance control
+        kd_vel = 0.1  # Derivative gain for velocity control
+        ki_dist = 0.00  # Integral gain for distance control
+        ki_dist_lateral = 0.00  # Integral gain for lateral distance control
+        ki_vel = 0.00  # Integral gain for velocity control
 
-            dist_error = x_cur[0] - next_overtake_location[0]  # longitudinal distance error
-            lateral_dis_error = x_cur[1] - next_overtake_location[1]
-            vel_error = desired_vel - x_cur[3]  # desired velocity in m/s
+        prev_dist = 0.0  # Previous distance to the leading vehicle
+        prev_lateral_dist = 0.0  # Previous lateral distance to the leading vehicle
+        prev_vel = 0.0  # Previous velocity of the ego vehicle
 
-            u_next = np.array([0.0, 0.0])  # reset control command
-            # PID control for distance and lateral distance
-            dist_control = kp_dist * dist_error + kd_dist * (dist_error - prev_dist) / dt + ki_dist * dist_sum
-            lateral_dist_control = kp_dist_lateral * lateral_dis_error + kd_dist_lateral * (lateral_dis_error - prev_lateral_dist) / dt + ki_dist_lateral * lateral_dist_sum
-            vel_control = kp_vel * vel_error + kd_vel * (vel_error - prev_vel) / dt + ki_vel * vel_sum
-            dist_sum += dist_error * dt
-            lateral_dist_sum += lateral_dis_error * dt
-            vel_sum += vel_error * dt
-            prev_dist = dist_error
-            prev_lateral_dist = lateral_dis_error
-            prev_vel = vel_error
-            # check for sum saturation
-            if dist_sum > 10.0:
-                dist_sum = 10.0
-            elif dist_sum < -10.0:
-                dist_sum = -10.0
-            if lateral_dist_sum > 10.0:
-                lateral_dist_sum = 10.0
-            elif lateral_dist_sum < -10.0:
-                lateral_dist_sum = -10.0
-            if vel_sum > 10.0:
-                vel_sum = 10.0
-            elif vel_sum < -10.0:
-                vel_sum = -10.0
+        dist_sum = 0.0  # Integral term for distance control
+        lateral_dist_sum = 0.0  # Integral term for lateral distance control
+        vel_sum = 0.0  # Integral term for velocity control
 
-            u_next[0] = lateral_dist_control
-            u_next[1] = (0.1* dist_control + 0.9* vel_control)   # average control for throttle/brake
+        # Initialize data collection before the main loop
+        os.makedirs('results', exist_ok=True)
+        simulation_data = []
+        sim_time = 0.0
 
-            control = convert2Carla(u_next)
-            ego_vehicle.apply_control(control)
-            carla_manager.world.tick()
-            time.sleep(0.05)
+        try:
+            # main loop:
+            while True:
+                # Control for the preceding vehicle
+                control_cmd = agent.run_step()
+                preceding_vehicle_actor.apply_control(control_cmd)
+                
+                # Get next waypoint
+                next_overtake_wp, current_wp_index = get_next_waypoint_from_list(waypoints, ego_vehicle_actor, current_wp_index, threshold=4.0)
+                lookahead_idx = min(current_wp_index + lookahead_offset, len(location_points)-1)
+                next_overtake_location = location_points[lookahead_idx]
+                
+                # Get current state
+                x_cur = get_current_state(ego_vehicle_actor)
 
-            # Log values for debugging
-            log_both(f"Stage: {stage}, Lookahead Index: {lookahead_idx}, Control: {u_next}, Desired Velocity: {desired_vel:.2f} km/h", log_file)
-            log_both(f"[EGO STATE] Position: ({x_cur[0]:.2f}, {x_cur[1]:.2f}), Heading: {np.degrees(x_cur[2]):.2f}°, Velocity: {x_cur[3]:.2f} m/s, Acceleration: {x_cur[4]:.2f} m/s²", log_file)
-            # print the target waypoint
-            log_both(f"[TARGET WAYPOINT] Location: ({next_overtake_location[0]:.2f}, {next_overtake_location[1]:.2f}, {next_overtake_location[2]:.2f})", log_file)
-            log_both(f"[PRECEDING VEHICLE] Location: ({preceding_vehicle.get_location().x:.2f}, {preceding_vehicle.get_location().y:.2f}), Speed: {preceding_vehicle.get_velocity().length():.2f} m/s", log_file)
-            log_both(f"[EGO VEHICLE] Location: ({ego_vehicle.get_location().x:.2f}, {ego_vehicle.get_location().y:.2f}), Speed: {ego_vehicle.get_velocity().length():.2f} m/s", log_file)
-            log_both(f"[DISTANCE] Longitudinal: {dist_error:.2f} m, Lateral: {lateral_dis_error:.2f} m", log_file)
-            log_both(f"[CONTROL] Throttle: {control.throttle:.2f}, Steer: {control.steer:.2f}, Brake: {control.brake:.2f}", log_file)
-            log_both("--------------------------------------------------", log_file)
+                # PID Control
+                dist_error = x_cur[0] - next_overtake_location[0]  # longitudinal distance error
+                lateral_dis_error = x_cur[1] - next_overtake_location[1]
+                vel_error = desired_vel - x_cur[3]  # desired velocity in m/s
 
-            v1 = preceding_vehicle.get_velocity()
-            v2 = ego_vehicle.get_velocity()
-            speed1 = 3.6 * (v1.x**2 + v1.y**2 + v1.z**2)**0.5  # km/h
-            speed2 = 3.6 * (v2.x**2 + v2.y**2 + v2.z**2)**0.5
-            # print(f"[EGO CONTROL] throttle: {control.throttle:.2f}, steer: {control.steer:.2f}, brake: {control.brake:.2f}")
-            # print(f"Preceding speed: {speed1:.2f} km/h | Ego speed: {speed2:.2f} km/h")
+                u_next = np.array([0.0, 0.0])  # reset control command
+                
+                # PID control for distance and lateral distance
+                dist_control = kp_dist * dist_error + kd_dist * (dist_error - prev_dist) / dt + ki_dist * dist_sum
+                lateral_dist_control = kp_dist_lateral * lateral_dis_error + kd_dist_lateral * (lateral_dis_error - prev_lateral_dist) / dt + ki_dist_lateral * lateral_dist_sum
+                vel_control = kp_vel * vel_error + kd_vel * (vel_error - prev_vel) / dt + ki_vel * vel_sum
+                
+                # Update PID state
+                dist_sum += dist_error * dt
+                lateral_dist_sum += lateral_dis_error * dt
+                vel_sum += vel_error * dt
+                prev_dist = dist_error
+                prev_lateral_dist = lateral_dis_error
+                prev_vel = vel_error
+                
+                # Apply saturation to integral terms
+                if dist_sum > 10.0:
+                    dist_sum = 10.0
+                elif dist_sum < -10.0:
+                    dist_sum = -10.0
+                if lateral_dist_sum > 10.0:
+                    lateral_dist_sum = 10.0
+                elif lateral_dist_sum < -10.0:
+                    lateral_dist_sum = -10.0
+                if vel_sum > 10.0:
+                    vel_sum = 10.0
+                elif vel_sum < -10.0:
+                    vel_sum = -10.0
 
-    except KeyboardInterrupt:
+                u_next[0] = lateral_dist_control  # Steering control
+                u_next[1] = (0.1 * dist_control + 0.9 * vel_control)  # Throttle/brake control
+
+                control = convert2Carla(u_next)
+                ego_vehicle_actor.apply_control(control)
+
+                # Save the state and control input as a csv file for plotting later
+                sim_time += dt
+                
+                # Get ego vehicle state in ego coordinates
+                ego_state = ego_vehicle.get_vehicle_state()
+                
+                # Get preceding vehicle position in ego coordinates
+                preceding_location = preceding_vehicle_actor.get_location()
+                preceding_pos_in_ego = ego_vehicle.world_to_ego_coordinates(preceding_location)
+                
+                # Get target waypoint in ego coordinates
+                wp_location = next_overtake_wp.transform.location
+                wp_pos_in_ego = ego_vehicle.world_to_ego_coordinates(wp_location)
+                
+                # Create data record
+                data_point = {
+                    'time': sim_time,
+                    'ego_x': ego_state[0],
+                    'ego_y': ego_state[1],
+                    'ego_heading': ego_state[2],
+                    'ego_speed': ego_state[3],
+                    'ego_accel': ego_state[4],
+                    'preceding_x': preceding_pos_in_ego[0],
+                    'preceding_y': preceding_pos_in_ego[1],
+                    'control_throttle': control.throttle,
+                    'control_brake': control.brake,
+                    'control_steer': control.steer,
+                    'target_waypoint_x': wp_pos_in_ego[0],
+                    'target_waypoint_y': wp_pos_in_ego[1],
+                    'pid_steer_cmd': u_next[0],
+                    'pid_accel_cmd': u_next[1]
+                }
+                
+                # Append to data collection
+                simulation_data.append(data_point)
+                
+                # Check if target position reached (100m in ego x-direction)
+                if ego_state[0] >= 100:
+                    print(f"Target position reached at {ego_state[0]:.2f}m in ego frame. Ending simulation.")
+                    
+                    # Save data to CSV
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    csv_filename = f'results/overtaking_simulation_{timestamp}_PID.csv'
+                    
+                    with open(csv_filename, 'w', newline='') as csvfile:
+                        writer = csv.DictWriter(csvfile, fieldnames=data_point.keys())
+                        writer.writeheader()
+                        for data_row in simulation_data:
+                            writer.writerow(data_row)
+                    
+                    print(f"Data saved to {csv_filename}")
+                    break
+
+                carla_manager.world.tick()
+                time.sleep(0.05)
+
+                # Log values for debugging
+                log_both(f"Stage: {stage}, Lookahead Index: {lookahead_idx}, Control: {u_next}, Desired Velocity: {desired_vel:.2f} km/h", log_file)
+                log_both(f"[EGO STATE] Position: ({x_cur[0]:.2f}, {x_cur[1]:.2f}), Heading: {np.degrees(x_cur[2]):.2f}°, Velocity: {x_cur[3]:.2f} m/s, Acceleration: {x_cur[4]:.2f} m/s²", log_file)
+                log_both(f"[TARGET WAYPOINT] Location: ({next_overtake_location[0]:.2f}, {next_overtake_location[1]:.2f}, {next_overtake_location[2]:.2f})", log_file)
+                log_both(f"[PRECEDING VEHICLE] Location: ({preceding_vehicle_actor.get_location().x:.2f}, {preceding_vehicle_actor.get_location().y:.2f}), Speed: {preceding_vehicle_actor.get_velocity().length():.2f} m/s", log_file)
+                log_both(f"[EGO VEHICLE] Location: ({ego_vehicle_actor.get_location().x:.2f}, {ego_vehicle_actor.get_location().y:.2f}), Speed: {ego_vehicle_actor.get_velocity().length():.2f} m/s", log_file)
+                log_both(f"[DISTANCE] Longitudinal: {dist_error:.2f} m, Lateral: {lateral_dis_error:.2f} m", log_file)
+                log_both(f"[CONTROL] Throttle: {control.throttle:.2f}, Steer: {control.steer:.2f}, Brake: {control.brake:.2f}", log_file)
+                log_both("--------------------------------------------------", log_file)
+
+        except KeyboardInterrupt:
+            print("\nSimulation terminated by user")
+
+    except Exception as e:
+        print(f"Error during simulation: {e}")
+        traceback.print_exc()
+
+    finally:
+        # Save collected data to CSV if simulation was interrupted
+        if 'simulation_data' in locals() and len(simulation_data) > 0:
+            os.makedirs('results', exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            csv_filename = f'results/overtaking_simulation_{timestamp}_PID.csv'
+            
+            with open(csv_filename, 'w', newline='') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=simulation_data[0].keys())
+                writer.writeheader()
+                for data_row in simulation_data:
+                    writer.writerow(data_row)
+            
+            print(f"Simulation data saved to {csv_filename}")
+        
+        # Cleanup
+        if 'preceding_vehicle_actor' in locals() and preceding_vehicle_actor is not None:
+            preceding_vehicle_actor.destroy()
+        if 'ego_vehicle_actor' in locals() and ego_vehicle_actor is not None:
+            ego_vehicle_actor.destroy()
         carla_manager.__del__()
-        print('Closing Carla')
-
-
-
-
-        
+        log_both("==== PID Tracking Log End ====", log_file)
+        log_file.close()
+        print("Simulation completed and log file closed.")
