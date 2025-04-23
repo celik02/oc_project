@@ -5,7 +5,7 @@ import carla
 from agents.navigation.global_route_planner import GlobalRoutePlanner  # type: ignore
 from agents.navigation.basic_agent import BasicAgent
 from vehicle import Vehicle  # Import the Vehicle class
-from carla_setup import get_next_waypoint_from_list
+from pid import get_next_waypoint_from_list
 import traceback
 import casadi as ca
 import logging

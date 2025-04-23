@@ -595,9 +595,9 @@ def convert2Carla(u_next, max_steer=0.4, max_accel=3.0, max_decel=5.0):
 if __name__ == "__main__":
 
     # Debug
-    log_file = open("lqr_tracking_log.txt", "w")
+    log_file = open("pid_tracking_log.txt", "w")
     atexit.register(log_file.close)
-    log_file.write("==== LQR Tracking Log Start ====\n")
+    log_file.write("==== pid Tracking Log Start ====\n")
 
     carla_manager = CarlaManager()
     print("CarlaManager is created")
@@ -635,58 +635,103 @@ if __name__ == "__main__":
     current_wp_index = 0
     u_next = np.zeros(2)
     stage = "STRAIGHT"
-    desired_vel = 25.0
+    desired_vel = 25.0 * 5 / 18 # desired velocity in m/s
+
+
+    kp_dist = 0.1  # Proportional gain for distance control
+    kp_dist_lateral = 1.0  # Proportional gain for lateral distance control
+    kp_vel = 0.5  # Proportional gain for velocity control
+    kd_dist = 0.2  # Derivative gain for distance control
+    kd_dist_lateral = 0.3  # Derivative gain for lateral distance control
+    kd_vel = 0.1  # Derivative gain for velocity control
+    ki_dist = 0.00  # Integral gain for distance control
+    ki_dist_lateral = 0.00  # Integral gain for lateral distance control
+    ki_vel = 0.00  # Integral gain for velocity control
+
+    prev_dist = 0.0  # Previous distance to the leading vehicle
+    prev_lateral_dist = 0.0  # Previous lateral distance to the leading vehicle
+    prev_vel = 0.0  # Previous velocity of the ego vehicle
+
+    dist_sum = 0.0  # Integral term for distance control
+    lateral_dist_sum = 0.0  # Integral term for lateral distance control
+    vel_sum = 0.0  # Integral term for velocity control
 
     try:
+        
         # main loop:
         while True:
             # Control for the preceding vehicle
             control_cmd = agent.run_step()
             preceding_vehicle.apply_control(control_cmd)
             # LQR for the ego vehicle
-            next_overtake_wp, current_wp_index = get_next_waypoint_from_list(waypoints, ego_vehicle, current_wp_index, threshold=2.0)
+            next_overtake_wp, current_wp_index = get_next_waypoint_from_list(waypoints, ego_vehicle, current_wp_index, threshold=4.0)
             lookahead_idx = min(current_wp_index + lookahead_offset, len(location_points)-1)
             next_overtake_location = location_points[lookahead_idx]
             # next_overtake_location = location_points[current_wp_index]
             # Get current state
             x_cur = get_current_state(ego_vehicle)
 
-            # Get control w.r.t. next_wp and current state
-            if (lookahead_idx == transitionIdx[0]) or (lookahead_idx == transitionIdx[2]):  # start tranistion
-                stage = "TRANSITION"
-            elif (lookahead_idx == transitionIdx[1]) or (lookahead_idx == transitionIdx[3]):    # start straight
-                stage = "STRAIGHT"
+            # # Get control w.r.t. next_wp and current state
+            # if (lookahead_idx == transitionIdx[0]) or (lookahead_idx == transitionIdx[2]):  # start tranistion
+            #     stage = "TRANSITION"
+            # elif (lookahead_idx == transitionIdx[1]) or (lookahead_idx == transitionIdx[3]):    # start straight
+            #     stage = "STRAIGHT"
 
-            dist = abs(ego_vehicle.get_location().x - preceding_vehicle.get_location().x)
-            lateral_dis = abs(ego_vehicle.get_location().y - preceding_vehicle.get_location().y)
-            if dist < safe_distance and lateral_dis < 1.0 and lookahead_idx < transitionIdx[0]:
-                desired_vel = 15.0  
-            else:
-                desired_vel = 25.0
+            # x = ego_vehicle.get_location().x - preceding_vehicle.get_location().x
+            # y = ego_vehicle.get_location().y - preceding_vehicle.get_location().y
+            # if abs(x) < safe_distance and abs(y) < 1.0 and lookahead_idx < transitionIdx[0]:
+            #     desired_vel = 10.0  
+            # else:
+            #     desired_vel = 20.0
 
-            u_next, x_next, x0 = LQR_Controller(x_cur, location_points, lookahead_idx, u_next, desired_vel, stage)     # desired velocity as 20 km/h
+            dist_error = x_cur[0] - next_overtake_location[0]  # longitudinal distance error
+            lateral_dis_error = x_cur[1] - next_overtake_location[1]
+            vel_error = desired_vel - x_cur[3]  # desired velocity in m/s
+
+            u_next = np.array([0.0, 0.0])  # reset control command
+            # PID control for distance and lateral distance
+            dist_control = kp_dist * dist_error + kd_dist * (dist_error - prev_dist) / dt + ki_dist * dist_sum
+            lateral_dist_control = kp_dist_lateral * lateral_dis_error + kd_dist_lateral * (lateral_dis_error - prev_lateral_dist) / dt + ki_dist_lateral * lateral_dist_sum
+            vel_control = kp_vel * vel_error + kd_vel * (vel_error - prev_vel) / dt + ki_vel * vel_sum
+            dist_sum += dist_error * dt
+            lateral_dist_sum += lateral_dis_error * dt
+            vel_sum += vel_error * dt
+            prev_dist = dist_error
+            prev_lateral_dist = lateral_dis_error
+            prev_vel = vel_error
+            # check for sum saturation
+            if dist_sum > 10.0:
+                dist_sum = 10.0
+            elif dist_sum < -10.0:
+                dist_sum = -10.0
+            if lateral_dist_sum > 10.0:
+                lateral_dist_sum = 10.0
+            elif lateral_dist_sum < -10.0:
+                lateral_dist_sum = -10.0
+            if vel_sum > 10.0:
+                vel_sum = 10.0
+            elif vel_sum < -10.0:
+                vel_sum = -10.0
+
+            u_next[0] = lateral_dist_control
+            u_next[1] = (0.1* dist_control + 0.9* vel_control)   # average control for throttle/brake
 
             control = convert2Carla(u_next)
             ego_vehicle.apply_control(control)
             carla_manager.world.tick()
             time.sleep(0.05)
 
-            #### Debug
-            # print(f"x_curr: {x_cur[0]:.2f}, {x_cur[1]:.2f}")
-            # print(f"next_overtake_loc: {next_overtake_location[0]:.2f}, {next_overtake_location[1]:.2f}")
-            # print(f"x_next: {x_next[0]:.2f}, {x_next[1]:.2f}", "idx is: ", current_wp_index)
+            # Log values for debugging
+            log_both(f"Stage: {stage}, Lookahead Index: {lookahead_idx}, Control: {u_next}, Desired Velocity: {desired_vel:.2f} km/h", log_file)
+            log_both(f"[EGO STATE] Position: ({x_cur[0]:.2f}, {x_cur[1]:.2f}), Heading: {np.degrees(x_cur[2]):.2f}°, Velocity: {x_cur[3]:.2f} m/s, Acceleration: {x_cur[4]:.2f} m/s²", log_file)
+            # print the target waypoint
+            log_both(f"[TARGET WAYPOINT] Location: ({next_overtake_location[0]:.2f}, {next_overtake_location[1]:.2f}, {next_overtake_location[2]:.2f})", log_file)
+            log_both(f"[PRECEDING VEHICLE] Location: ({preceding_vehicle.get_location().x:.2f}, {preceding_vehicle.get_location().y:.2f}), Speed: {preceding_vehicle.get_velocity().length():.2f} m/s", log_file)
+            log_both(f"[EGO VEHICLE] Location: ({ego_vehicle.get_location().x:.2f}, {ego_vehicle.get_location().y:.2f}), Speed: {ego_vehicle.get_velocity().length():.2f} m/s", log_file)
+            log_both(f"[DISTANCE] Longitudinal: {dist_error:.2f} m, Lateral: {lateral_dis_error:.2f} m", log_file)
+            log_both(f"[CONTROL] Throttle: {control.throttle:.2f}, Steer: {control.steer:.2f}, Brake: {control.brake:.2f}", log_file)
+            log_both("--------------------------------------------------", log_file)
 
-            log_both("=" * 50, log_file)
-            log_both(f"x_cur: x = {x_cur[0]:.2f}, y = {x_cur[1]:.2f}, ψ = {np.degrees(x_cur[2]):.1f}°, v = {x_cur[3]:.2f} m/s", log_file)
-            # log_both(f"lqr linearization center: x = {x0[0]:.2f}, y = {x0[1]:.2f}, ψ = {np.degrees(x0[2]):.1f}°", log_file)
-            log_both(f"target (linearization center): x = {x0[0]:.2f}, y = {x0[1]:.2f}, ψ = {np.degrees(x0[2]):.1f}°", log_file)
-            log_both(f"x_next: x = {x_next[0]:.2f}, y = {x_next[1]:.2f}, ψ = {np.degrees(x_next[2]):.1f}°", log_file)
-            log_both(f"distance to the leading vehicle: {dist}, lateral distance: {lateral_dis}, current desired vel: {desired_vel* 5 / 18}", log_file)
-            log_both(f"index: {lookahead_idx}, current stage: {stage}", log_file)
-            dpsi = wrap_to_pi(x_cur[2] - x0[2])
-            log_both(f"error: dx = {x_cur[0] - next_overtake_location[0]:.2f}, dy = {x_cur[1] - next_overtake_location[1]:.2f}, dpsi = {np.degrees(dpsi):.1f}", log_file)
-            log_both("=" * 50, log_file)
-            
             v1 = preceding_vehicle.get_velocity()
             v2 = ego_vehicle.get_velocity()
             speed1 = 3.6 * (v1.x**2 + v1.y**2 + v1.z**2)**0.5  # km/h

@@ -1,5 +1,5 @@
 import numpy as np
-from carla_setup import CarlaManager
+from pid import CarlaManager
 from vehicle import Vehicle
 import copy
 import time
