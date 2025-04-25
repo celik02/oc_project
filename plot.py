@@ -131,6 +131,11 @@ def calculate_metrics(df):
     metrics['preceding_x'] = df['preceding_x'].values
     metrics['preceding_y'] = df['preceding_y'].values
     
+    # ADD THESE LINES to capture target waypoint data
+    if 'target_waypoint_x' in df.columns and 'target_waypoint_y' in df.columns:
+        metrics['target_waypoint_x'] = df['target_waypoint_x'].values
+        metrics['target_waypoint_y'] = df['target_waypoint_y'].values
+    
     return metrics
 
 def smooth_data(data, window_length=11, polyorder=3):
@@ -158,25 +163,85 @@ def extract_algorithm_name(filename):
     return os.path.splitext(base)[0]
 
 def plot_trajectories(metrics_dict, output_dir):
-    """Plot vehicle trajectories for all algorithms."""
+    """Plot vehicle trajectories with reference path extrapolated correctly to longitude 100."""
     plt.figure(figsize=(10, 6))
     
-    for algo, metrics in metrics_dict.items():
-        # Plot ego vehicle trajectory
-        plt.plot(metrics['ego_x'], metrics['ego_y'], label=f'{algo} - Ego Vehicle')
+    # Check if metrics dictionary is empty
+    if not metrics_dict:
+        print("No metrics data available for plotting trajectories.")
+        return
+    
+    # Choose the first algorithm's data for fitting the reference path
+    first_algo = list(metrics_dict.keys())[0]
+    preceding_x = metrics_dict[first_algo]['preceding_x']
+    preceding_y = metrics_dict[first_algo]['preceding_y']
+    
+    # Prepare data for fitting by sorting and removing duplicates
+    sorted_indices = np.argsort(preceding_x)
+    sorted_x = preceding_x[sorted_indices]
+    sorted_y = preceding_y[sorted_indices]
+    
+    unique_indices = np.unique(sorted_x, return_index=True)[1]
+    unique_x = sorted_x[unique_indices]
+    unique_y = sorted_y[unique_indices]
+    
+    if len(unique_x) > 3:
+        # Option 1: Use a quadratic polynomial (degree 2) instead of cubic
+        # This typically results in a simpler curve with less unexpected behavior
+        poly_coeffs = np.polyfit(unique_x, unique_y, 2)  # Changed from degree 3 to 2
+        poly_fit = np.poly1d(poly_coeffs)
         
-        # Plot preceding vehicle trajectory
+        # Option 2: Use linear extrapolation for the final segment
+        # Get the direction of the last segment of data to ensure downward trend
+        last_points_x = unique_x[-min(5, len(unique_x)):]
+        last_points_y = unique_y[-min(5, len(unique_y)):]
+        
+        # Calculate linear trend for extrapolation
+        end_slope, end_intercept = np.polyfit(last_points_x, last_points_y, 1)
+        
+        # Determine the transition point where we switch from polynomial to linear
+        # Use the maximum x value from the data as the transition point
+        x_max = np.max(preceding_x)
+        
+        # Generate extrapolated paths - polynomial for observed range, linear for extrapolation
+        # First part: from minimum x to maximum observed x (use polynomial)
+        x_min = np.min(preceding_x)
+        observed_x = np.linspace(x_min, x_max, 100)
+        observed_y = poly_fit(observed_x)
+        
+        # Second part: from maximum observed x to longitude 100 (linear with enforced trend)
+        # If end_slope is not negative, force it to be slightly negative to ensure downward trend
+        if end_slope >= 0:
+            end_slope = -0.05  # Force a slight downward slope
+        
+        extrapolated_x = np.linspace(x_max, 100, 100)
+        # y = mx + b, where m is the slope and b is adjusted to ensure continuity at x_max
+        last_poly_y = poly_fit(x_max)  # Polynomial y-value at transition point
+        extrapolated_y = end_slope * (extrapolated_x - x_max) + last_poly_y
+        
+        # Combine the two parts
+        extrap_x = np.concatenate([observed_x, extrapolated_x])
+        extrap_y = np.concatenate([observed_y, extrapolated_y])
+        
+        # Plot the improved reference path
+        plt.plot(extrap_x, extrap_y, 'k--', linewidth=2, 
+                label='Extrapolated Reference Path')
+    
+    # Plot actual trajectories for all algorithms
+    for algo, metrics in metrics_dict.items():
+        plt.plot(metrics['ego_x'], metrics['ego_y'], label=f'{algo} - Ego Vehicle')
         plt.scatter(metrics['preceding_x'], metrics['preceding_y'], 
                    marker='x', alpha=0.5, label=f'{algo} - Preceding Vehicle')
     
     plt.xlabel('Longitudinal Position (m)')
     plt.ylabel('Lateral Position (m)')
-    plt.title('Vehicle Trajectories')
+    plt.title('Vehicle Trajectories with Extended Reference Path')
     plt.grid(True)
     plt.legend()
     plt.savefig(os.path.join(output_dir, 'trajectories.png'), dpi=300, bbox_inches='tight')
     plt.close()
 
+    
 def plot_speed_profiles(metrics_dict, output_dir):
     """Plot speed profiles for all algorithms."""
     plt.figure(figsize=(10, 6))
@@ -250,16 +315,38 @@ def plot_comfort_metrics(metrics_dict, output_dir):
     plt.close()
 
 def plot_lateral_deviation(metrics_dict, output_dir):
-    """Plot lateral deviation from reference path for all algorithms."""
+    """
+    Plot lateral deviation showing target waypoints and actual path.
+    
+    This function visualizes:
+    1. The target waypoints that the controller was following
+    2. The lateral position of the ego vehicle(s) over time
+    """
+    # Create a figure with appropriate dimensions
     plt.figure(figsize=(10, 6))
     
-    for algo, metrics in metrics_dict.items():
-        plt.plot(metrics['time'], metrics['ego_y'], label=f'{algo}')
+    # Defensive programming: Check for empty data
+    if not metrics_dict:
+        print("No metrics data available for plotting lateral deviation.")
+        return
     
-    plt.axhline(y=0, color='k', linestyle='--', label='Reference Path')
+    # Plot target waypoints for each algorithm
+    for algo, metrics in metrics_dict.items():
+        if 'target_waypoint_y' in metrics and 'time' in metrics:
+            plt.scatter(metrics['time'], metrics['target_waypoint_y'], 
+                       marker='o', s=30, alpha=0.5,
+                       label=f'{algo} - Target Waypoints')
+        else:
+            print(f"Warning: Target waypoint data not found for {algo}")
+        
+    # Plot ego vehicle lateral positions for each control algorithm
+    for algo, metrics in metrics_dict.items():
+        plt.plot(metrics['time'], metrics['ego_y'], label=f'{algo} - Ego Path')
+        
+    # Finalize plot with proper formatting and annotations
     plt.xlabel('Time (s)')
-    plt.ylabel('Lateral Deviation (m)')
-    plt.title('Lateral Deviation from Reference Path')
+    plt.ylabel('Lateral Position (m)')
+    plt.title('Lateral Deviation with Target Waypoints')
     plt.grid(True)
     plt.legend()
     plt.savefig(os.path.join(output_dir, 'lateral_deviation.png'), dpi=300, bbox_inches='tight')
@@ -435,9 +522,13 @@ def main():
     
     # Comfort metrics
     plot_comfort_metrics(metrics_dict, args.output_dir)
-    
+
     # Lateral deviation
-    plot_lateral_deviation(metrics_dict, args.output_dir)
+    if metrics_dict:
+        print("Plotting lateral deviation...")
+        plot_lateral_deviation(metrics_dict, args.output_dir)
+    else:
+        print("No valid data available for lateral deviation plot.")
     
     # Power consumption
     plot_power_consumption(metrics_dict, args.output_dir)

@@ -82,8 +82,8 @@ class BicycleMPCController:
         self.min_steer = -np.pi / 4  # Min steering allowed (rad)
 
         # Cost function weights
-        self.w_path = 50.0      # Path following reward
-        self.w_speed = 10.0     # Target speed reward
+        self.w_path = 30.0      # Path following reward
+        self.w_speed = 0.0     # Target speed reward
         self.w_accel = 1.0      # Acceleration minimization
         self.w_steer = 1.0      # Steering minimization
         self.w_jerk = 5.0       # Jerk minimization (change in acceleration)
@@ -105,6 +105,17 @@ class BicycleMPCController:
         Returns:
             carla.VehicleControl object
         """
+        # clear all drawned objects in CARLA
+        if self.carla_manager:
+            self.carla_manager.world.debug.draw_string(
+                carla.Location(x=0, y=0, z=0),
+                "",
+                draw_shadow=False,
+                color=carla.Color(r=0, g=0, b=0),
+                life_time=120.0,
+                persistent_lines=True,
+            )
+            
         # Get ego vehicle state
         x0 = ego_vehicle.get_vehicle_state()
 
@@ -117,9 +128,32 @@ class BicycleMPCController:
         preceding_vehicle_pred = self.predict_vehicle_trajectory(
             preceding_pos_in_ego, PRECEDING_SPEED)
 
-        # Create reference path (straight ahead in ego coordinates)
+
+        # Generate reference path in ego coordinates
         reference_path = self.generate_reference_path(x0[0])
 
+        # Visualize reference path in CARLA but after reverting it back to the # world coordinates
+        if self.carla_manager:
+            # Convert reference path to world coordinates while padding the z co-ordinates with zero
+            reference_path_world = [
+                ego_vehicle.ego_to_world_coordinates((point[0], point[1], 0.0))
+                for point in reference_path
+            ]
+            # Draw the reference path in CARLA
+            # convert to carla location objects
+            reference_path_world = [
+                carla.Location(x=point[0], y=point[1], z=point[2])
+                for point in reference_path_world
+            ]
+            for point in reference_path_world:
+                self.carla_manager.world.debug.draw_string(
+                    point,
+                    "O",
+                    draw_shadow=False,
+                    color=carla.Color(r=0, g=255, b=0),
+                    life_time=120.0,
+                    persistent_lines=True,
+                )
 
         # Initialize or update CasADi solver
         if not self.casadi_setup_done:
@@ -161,11 +195,11 @@ class BicycleMPCController:
         for i in range(self.horizon):
             # Points spaced at 1m intervals directly ahead
             x = (i + 1) * 1.0 + x_start  # 1m ahead for each step
-            y = 0.0  # Center of lane
+            y = 0.0 - i*0.1  # Center of lane
             path.append((x, y))
 
         return path
-
+    
     def setup_casadi_solver(self):
         """
         Setup the CasADi solver for MPC optimization with bicycle model.
@@ -233,18 +267,24 @@ class BicycleMPCController:
 
             # Collision avoidance with preceding vehicle
             # Define ellipsoid safety zone
-            a = 6.0  # Longitudinal semi-axis
-            b = 3.0  # Lateral semi-axis
+            a = 7.0  # Longitudinal semi-axis
+            b = 3.5  # Lateral semi-axis
 
-            # Distance to preceding vehicle at step k
+            # Original ellipsoidal distance calculation
             dx = xk[0] - preceding_x[k]
             dy = xk[1] - preceding_y[k]
+            ellipsoid_distance = (dx/a)**2 + (dy/b)**2
 
-            # Ellipsoidal safety constraint: (dx/a)² + (dy/b)² >= 1
-            safety_constraint = (dx/a)**2 + (dy/b)**2
+            # When ego is behind: constraint is "ellipsoid_distance >= 1.0"
+            # When ego is ahead by 3.0: constraint is "0 >= 0" (automatically satisfied)
+            safety_constraint = ca.if_else(dx < 1.0,  
+                                        ellipsoid_distance - 1.0,  # When behind: must stay outside ellipsoid
+                                        0.0)                       # When ahead: constraint inactive (0 >= 0)
+
             g.append(safety_constraint)
-            lbg.append(1.0)  # Must be outside ellipsoid
+            lbg.append(0.0)  # Constraint must be >= 0
             ubg.append(ca.inf)
+            
 
             # State propagation
             xk_next = dynamics_func(xk, uk)
@@ -257,7 +297,7 @@ class BicycleMPCController:
 
                 # State bounds
                 opt_vars_lb.extend([-ca.inf, -ca.inf, -ca.inf, 0, self.min_accel])  # v >= 0, a >= -5
-                opt_vars_ub.extend([ca.inf, ca.inf, ca.inf, 40, 5.0])     #self.max_accel<= 40, a <= 5
+                opt_vars_ub.extend([ca.inf, ca.inf, ca.inf, 40, self.max_accel])     #self.max_accel<= 40, a <= 5
 
                 # Dynamics constraints (next state follows dynamics model)
                 g.append(xk_next_var - xk_next)
@@ -280,14 +320,14 @@ class BicycleMPCController:
 
         # Solver options
         opts = {
-            'ipopt': {
-                'print_level': 0,
-                'max_iter': 500,
-                'acceptable_tol': 1e-4,
-                'warm_start_init_point': 'yes',
-            },
-            'print_time': False
-        }
+                'ipopt': {
+                    'print_level': 0,                # Minimal output
+                    'max_iter': 500,                 # Reduced from 500 for speed
+                    'acceptable_tol': 1e-4,          # Slightly relaxed tolerance
+                    'warm_start_init_point': 'yes',
+                },
+                'print_time': False
+            }
 
         # Store constraint bounds
         self.lbg = lbg
@@ -362,13 +402,13 @@ class BicycleMPCController:
             # Check solution status
             stats = self.solver.stats()
             if stats['return_status'] not in ['Solve_Succeeded', 'Solved_To_Acceptable_Level']:
-                # print(f"Warning: Solver status: {stats['return_status']}")
+                print(f"Warning: Solver status: {stats['return_status']}")
                 # Return zero steering and negative acceleration as fallback
                 control = np.zeros((self.horizon, self.num_controls))
-                control[:, 0] = self.min_accel / 100  # Negative acceleration
+                # control[:, 0] = self.min_accel / 100  # Negative acceleration
                 return control
-            # else:
-            #     print(f"Solver succeeded: {stats['return_status']}")
+            else:
+                print(f"Solver succeeded: {stats['return_status']}")
 
             # Extract solution
             x_opt = sol['x'].full().flatten()
@@ -720,7 +760,7 @@ def run_simulation_with_casadi():
                 run_simulation_with_casadi.simulation_data.append(data_point)
 
                 # Check if target position reached (100m in ego x-direction)
-                if ego_state[0] >= 100:
+                if ego_state[0] >= 100.0:
                     print(f"Target position reached at {ego_state[0]:.2f}m in ego frame. Ending simulation.")
                     
                     # Save data to CSV

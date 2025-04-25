@@ -287,7 +287,7 @@ def generate_lane_change_segment(last_wp, carla_map, direction="left", forward_l
     return segment, seg_loc
                
 def generate_overtake_waypoints(carla_manager, vehicle, direction="left",
-                                distance_current_lane=10.0,
+                                distance_current_lane=5.0,
                                 lane_change_step=2.0,
                                 overtake_distance=50.0,
                                 merge_distance=10.0):
@@ -341,7 +341,8 @@ def generate_overtake_waypoints(carla_manager, vehicle, direction="left",
     transitionIdx.append(len(waypoints)-1)
 
     # 2. Change lane
-    lane_change_segment, location_segment = generate_lane_change_segment(last_wp, _map, direction)
+    lane_change_segment, location_segment = generate_lane_change_segment(last_wp, _map, forward_length=7.0,
+                                                                        direction=direction, steps=10)
 
     waypoints.extend(lane_change_segment)
     locationPos.extend(location_segment)
@@ -369,9 +370,9 @@ def generate_overtake_waypoints(carla_manager, vehicle, direction="left",
 
     # 4. Merge back to the original lane.
     if direction == "left":
-        lane_change_segment, location_segment = generate_lane_change_segment(last_wp, _map, "right")
+        lane_change_segment, location_segment = generate_lane_change_segment(last_wp, _map, "right", forward_length=15.0)
     else:
-        lane_change_segment, location_segment = generate_lane_change_segment(last_wp, _map, "left")
+        lane_change_segment, location_segment = generate_lane_change_segment(last_wp, _map, "left", forward_length=15.0)
 
     waypoints.extend(lane_change_segment)
     locationPos.extend(location_segment)
@@ -531,8 +532,8 @@ if __name__ == "__main__":
                                                 direction="left",
                                                 distance_current_lane=10.0,
                                                 lane_change_step=1.0,
-                                                overtake_distance=40.0,
-                                                merge_distance=100.0)
+                                                overtake_distance=50.0,
+                                                merge_distance=50.0)
         # For debugging, you can visualize the waypoints:
         carla_manager.debug_np_locations(location_points)
 
@@ -546,11 +547,11 @@ if __name__ == "__main__":
         kp_dist_lateral = 1.0  # Proportional gain for lateral distance control
         kp_vel = 0.5  # Proportional gain for velocity control
         kd_dist = 0.2  # Derivative gain for distance control
-        kd_dist_lateral = 0.3  # Derivative gain for lateral distance control
+        kd_dist_lateral = 0.5  # Derivative gain for lateral distance control
         kd_vel = 0.1  # Derivative gain for velocity control
-        ki_dist = 0.00  # Integral gain for distance control
-        ki_dist_lateral = 0.00  # Integral gain for lateral distance control
-        ki_vel = 0.00  # Integral gain for velocity control
+        ki_dist = 0.01  # Integral gain for distance control
+        ki_dist_lateral = 0.02  # Integral gain for lateral distance control
+        ki_vel = 0.05  # Integral gain for velocity control
 
         prev_dist = 0.0  # Previous distance to the leading vehicle
         prev_lateral_dist = 0.0  # Previous lateral distance to the leading vehicle
@@ -615,7 +616,7 @@ if __name__ == "__main__":
                     vel_sum = -10.0
 
                 u_next[0] = lateral_dist_control  # Steering control
-                u_next[1] = (0.1 * dist_control + 0.9 * vel_control)  # Throttle/brake control
+                u_next[1] = (0.0 * dist_control + 1.0 * vel_control)  # Throttle/brake control
 
                 control = convert2Carla(u_next)
                 ego_vehicle_actor.apply_control(control)
@@ -631,7 +632,9 @@ if __name__ == "__main__":
                 preceding_pos_in_ego = ego_vehicle.world_to_ego_coordinates(preceding_location)
                 
                 # Get target waypoint in ego coordinates
-                wp_location = next_overtake_wp.transform.location
+                wp_location = carla.Location(x=next_overtake_location[0], 
+                                            y=next_overtake_location[1], 
+                                            z=next_overtake_location[2])
                 wp_pos_in_ego = ego_vehicle.world_to_ego_coordinates(wp_location)
                 
                 # Create data record
@@ -657,7 +660,7 @@ if __name__ == "__main__":
                 simulation_data.append(data_point)
                 
                 # Check if target position reached (100m in ego x-direction)
-                if ego_state[0] >= 100:
+                if ego_state[0] >= 100.0:
                     print(f"Target position reached at {ego_state[0]:.2f}m in ego frame. Ending simulation.")
                     
                     # Save data to CSV
