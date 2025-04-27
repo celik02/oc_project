@@ -17,7 +17,8 @@ SPAWN_LOCATION = [
 ]  # for spectator camera
 
 # synchronous_mode will make the simulation predictable
-synchronous_mode = False
+synchronous_mode = True
+
 
 def log_both(msg, log_file):
     """
@@ -183,7 +184,7 @@ class CarlaManager:
                     life_time=120.0,
                     persistent_lines=True,
                 )
-    
+
     def debug_np_locations(self, np_locations, z_height=0.2):
         # draw all the locations
         for pt in np_locations:
@@ -196,7 +197,8 @@ class CarlaManager:
                 persistent_lines=True,
             )
 
-def generate_lane_change_segment(last_wp, carla_map, direction="left", forward_length = 20.0, steps = 10):
+
+def generate_lane_change_segment(last_wp, carla_map, direction="left", forward_length=20.0, steps=10):
     """
     Generate a smooth lane change segment from last_wp into adjacent lane
 
@@ -207,7 +209,7 @@ def generate_lane_change_segment(last_wp, carla_map, direction="left", forward_l
         forward_length: (float) forward length to finish transition
         lateral_length: (float) lateral length to finsih transition
         steps: #wp generated for thr transition
-        
+
 
     Returns:
         segment: List of interpolated carla.Location points
@@ -227,7 +229,7 @@ def generate_lane_change_segment(last_wp, carla_map, direction="left", forward_l
     if not next_wps:
         print("No forward waypoint found.")
         return segment, seg_loc
-    
+
     p_forward = next_wps[0].transform.location
     forward_vec = np.array([p_forward.x - p_cur.x, p_forward.y - p_cur.y])
     forward_vec /= np.linalg.norm(forward_vec)
@@ -239,11 +241,11 @@ def generate_lane_change_segment(last_wp, carla_map, direction="left", forward_l
         side_wp = last_wp.get_left_lane()
     else:
         side_wp = last_wp.get_right_lane()
-    
+
     if side_wp is None:
         print(f"No {direction} lane available.")
         return segment, seg_loc
-    
+
     p_side = side_wp.transform.location
     lateral_vec = np.array([p_side.x - p_cur.x, p_side.y - p_cur.y])
     lateral_vec -= np.dot(lateral_vec, forward_vec) * forward_vec  # remove forward component
@@ -251,10 +253,10 @@ def generate_lane_change_segment(last_wp, carla_map, direction="left", forward_l
     if np.linalg.norm(lateral_vec) < 1e-3:
         print("Lateral vector is degenerate.")
         return segment, seg_loc
-    
+
     lateral_vec /= np.linalg.norm(lateral_vec)
     dLateralVec = dLateral * lateral_vec    # the lateral vector compared to last wp
-    
+
     # 4. Generate waypoints
     for i in range(1, steps + 1):
         offset = i * dForwardVec + i * dLateralVec
@@ -273,7 +275,8 @@ def generate_lane_change_segment(last_wp, carla_map, direction="left", forward_l
         seg_loc.append(curr_location)
 
     return segment, seg_loc
-    
+
+
 def generate_overtake_waypoints(carla_manager, vehicle, direction="left",
                                 distance_current_lane=10.0,
                                 lane_change_step=2.0,
@@ -298,7 +301,7 @@ def generate_overtake_waypoints(carla_manager, vehicle, direction="left",
     """
     _map = carla_manager.map
     waypoints = []
-    locationPos = []    
+    locationPos = []
     transitionIdx = []
 
     # 1. Start in current lane.
@@ -320,12 +323,12 @@ def generate_overtake_waypoints(carla_manager, vehicle, direction="left",
         loc = next_wp.transform.location
         curr_location = np.array([loc.x, loc.y, loc.z])
         traveled += next_wp.transform.location.distance(last_wp.transform.location)
-        
+
         waypoints.append(next_wp)
         locationPos.append(curr_location)
 
         last_wp = next_wp
-    
+
     transitionIdx.append(len(waypoints)-1)
 
     # 2. Change lane: get the adjacent lane from the last waypoint
@@ -382,7 +385,7 @@ def generate_overtake_waypoints(carla_manager, vehicle, direction="left",
     #     merging_wp = last_wp.get_left_lane()
     #     # next_merging_wp = merging_wp.next(lane_change_step)
     #     # next_merging_wp = next_merging_wp[0]
-# 
+#
     # if merging_wp is not None:
     #     waypoints.append(merging_wp)
     #     last_wp = merging_wp
@@ -400,7 +403,7 @@ def generate_overtake_waypoints(carla_manager, vehicle, direction="left",
     last_wp = lane_change_segment[-1]
     transitionIdx.append(len(waypoints)-1)
 
-    # 5. Follow the lane    
+    # 5. Follow the lane
     traveled = 0.0
     while traveled < merge_distance:
         next_wps = last_wp.next(lane_change_step)
@@ -426,7 +429,7 @@ def generate_overtake_waypoints(carla_manager, vehicle, direction="left",
 #                                 merge_distance=10.0):
 #     """
 #     Generate a list of waypoints for an overtaking maneuver.
-# 
+#
 #     Args:
 #         carla_manager: Instance of CarlaManager containing the map.
 #         vehicle: The vehicle actor (rear vehicle).
@@ -435,17 +438,17 @@ def generate_overtake_waypoints(carla_manager, vehicle, direction="left",
 #         lane_change_step (float): Interval (in meters) to sample waypoints.
 #         overtake_distance (float): Distance to follow in the adjacent lane.
 #         merge_distance (float): Distance to follow in merging lane after overtaking.
-# 
+#
 #     Returns:
 #         List of carla.Waypoint objects forming the overtaking trajectory.
 #     """
 #     _map = carla_manager.map
 #     waypoints = []
-# 
+#
 #     # 1. Start in current lane.
 #     current_wp = _map.get_waypoint(vehicle.get_location(), project_to_road=True)
 #     waypoints.append(current_wp)
-# 
+#
 #     # Follow current lane for distance_current_lane
 #     traveled = 0.0
 #     last_wp = current_wp
@@ -457,7 +460,7 @@ def generate_overtake_waypoints(carla_manager, vehicle, direction="left",
 #         traveled += next_wp.transform.location.distance(last_wp.transform.location)
 #         waypoints.append(next_wp)
 #         last_wp = next_wp
-# 
+#
 #     # 2. Change lane: get the adjacent lane from the last waypoint
 #         # 45 degree line segment spacing
 #     if direction == "left":
@@ -468,16 +471,16 @@ def generate_overtake_waypoints(carla_manager, vehicle, direction="left",
 #         adjacent_wp = last_wp.get_right_lane()
 #         # next_adjacent_wp = adjacent_wp.next(lane_change_step)
 #         # next_adjacent_wp =next_adjacent_wp[0]
-# 
+#
 #     if adjacent_wp is None:
 #         print("No adjacent lane available in direction", direction)
 #         return waypoints
-# 
+#
 #     waypoints.append(adjacent_wp)
 #     last_wp = adjacent_wp
 #     # waypoints.append(next_adjacent_wp)
 #     # last_wp = next_adjacent_wp
-# 
+#
 #     # 3. Follow adjacent lane for overtaking distance.
 #     traveled = 0.0
 #     while traveled < overtake_distance:
@@ -488,7 +491,7 @@ def generate_overtake_waypoints(carla_manager, vehicle, direction="left",
 #         traveled += next_wp.transform.location.distance(last_wp.transform.location)
 #         waypoints.append(next_wp)
 #         last_wp = next_wp
-# 
+#
 #     # 4. Merge back to the original lane.
 #         # 45 degree line segment spaceing
 #     if direction == "left":
@@ -499,13 +502,13 @@ def generate_overtake_waypoints(carla_manager, vehicle, direction="left",
 #         merging_wp = last_wp.get_left_lane()
 #         # next_merging_wp = merging_wp.next(lane_change_step)
 #         # next_merging_wp = next_merging_wp[0]
-# 
+#
 #     if merging_wp is not None:
 #         waypoints.append(merging_wp)
 #         last_wp = merging_wp
 #         # waypoints.append(next_merging_wp)
 #         # last_wp = next_merging_wp
-#         
+#
 #         traveled = 0.0
 #         while traveled < merge_distance:
 #             next_wps = last_wp.next(lane_change_step)
@@ -515,7 +518,7 @@ def generate_overtake_waypoints(carla_manager, vehicle, direction="left",
 #             traveled += next_wp.transform.location.distance(last_wp.transform.location)
 #             waypoints.append(next_wp)
 #             last_wp = next_wp
-# 
+#
 #     return waypoints
 
 
@@ -605,7 +608,7 @@ if __name__ == "__main__":
 
             # PID controller for ego vehicle -- not working yet
             next_overtake_wp, current_wp_index = get_next_waypoint_from_list(waypoints, ego_vehicle, current_wp_index, threshold=2.0)
-            
+
             if current_wp_index > 0:
                 prev_point = location_points[current_wp_index - 1]
             else:
@@ -627,16 +630,16 @@ if __name__ == "__main__":
             carla_manager.world.tick()
             time.sleep(0.05)
 
-            ## debug 
+            ## debug
             v1 = preceding_vehicle.get_velocity()
             v2 = ego_vehicle.get_velocity()
             speed1 = (v1.x**2 + v1.y**2 + v1.z**2)**0.5  # km/h
             speed2 = (v2.x**2 + v2.y**2 + v2.z**2)**0.5
-            
+
             log_both("=" * 50, log_file)
             log_both(f"[EGO CONTROL] throttle: {ego_control.throttle:.2f}, steer: {ego_control.steer:.2f}, brake: {ego_control.brake:.2f}", log_file)
             log_both(f"Preceding speed: {speed1:.2f} km/h | Ego speed: {speed2:.2f} km/h", log_file)
-            
+
             log_both("=" * 50, log_file)
 
     except KeyboardInterrupt:

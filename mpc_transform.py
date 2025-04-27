@@ -5,11 +5,11 @@ import carla
 from agents.navigation.global_route_planner import GlobalRoutePlanner  # type: ignore
 from agents.navigation.basic_agent import BasicAgent
 from vehicle import Vehicle  # Import the Vehicle class
-from carla_setup import get_next_waypoint_from_list
 import traceback
 import casadi as ca
 import logging
 import sys
+from hydra import initialize, compose
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.WARNING)
 FORMAT = "[%(asctime)s.%(msecs)03d %(filename)15s:%(lineno)3s - %(funcName)17s() ] %(levelname)s %(message)s"
@@ -25,6 +25,16 @@ PRECEDING_SPEED = 10 / 3.6  # m/s, speed of the preceding vehicle
 
 # synchronous_mode will make the simulation predictable
 synchronous_mode = True
+EKF = False
+measurement_dim = 2  # Measurement dimension
+# P0 = np.array([1., 1., 1., 1.])  # Initial covariance
+P0 = np.array([1.5, 1.5, 1.5, 1.])
+
+# Q = np.eye(state_dim) * 0.1  # Process noise covariance
+Q = np.diag([0.1, 0.1, 0.005, 0.5])  # Process noise covariance
+
+R = np.eye(measurement_dim) * 2  # Measurement noise covariance
+# R = np.diag([1, 1])  # Measurement noise covariance
 
 
 def bicycle_vehicle_dynamics_casadi(x, u, dt):
@@ -87,13 +97,13 @@ class BicycleMPCController:
         self.w_accel = 1.0      # Acceleration minimization
         self.w_steer = 1.0      # Steering minimization
         self.w_jerk = 5.0       # Jerk minimization (change in acceleration)
-        self.w_steer_rate = 10.0 # Steering rate minimization
+        self.w_steer_rate = 10.0  # Steering rate minimization
 
         # Initialize CasADi solver
         self.solver = None
         self.casadi_setup_done = False
 
-    def run_step(self, ego_vehicle, preceding_vehicle, target_speed):
+    def run_step(self, ego_vehicle: Vehicle, preceding_vehicle, target_speed):
         """
         Execute one step of MPC control using bicycle model
 
@@ -106,7 +116,10 @@ class BicycleMPCController:
             carla.VehicleControl object
         """
         # Get ego vehicle state
-        x0 = ego_vehicle.get_vehicle_state()
+        if not EKF:
+            x0 = ego_vehicle.get_vehicle_state()
+        else:
+            x0 = ego_vehicle.get_vehicle_state_kalman()  # Get the latest EKF state
 
         # Get preceding vehicle position in ego coordinates
         preceding_location = preceding_vehicle.actor.get_location()
@@ -119,7 +132,6 @@ class BicycleMPCController:
 
         # Create reference path (straight ahead in ego coordinates)
         reference_path = self.generate_reference_path(x0[0])
-
 
         # Initialize or update CasADi solver
         if not self.casadi_setup_done:
@@ -423,6 +435,7 @@ class BicycleMPCController:
 
         return control
 
+
 class CarlaManager:
     _instance = None
 
@@ -475,6 +488,53 @@ class CarlaManager:
         blueprint = self.blueprint_library.filter(blueprint_name)[0]
         vehicle = self.world.spawn_actor(blueprint, spawn_transform)
         return vehicle
+
+    def spawn_vehicle_sensor(self, blueprint_name, spawn_point, role_name='default', GPS=False, IMU=False):
+        '''
+        spawn a vehicle at the given spawn_point
+        '''
+        spawn_transform = self.map.get_waypoint(
+            carla.Location(x=spawn_point[0], y=spawn_point[1], z=10),
+            project_to_road=True).transform
+        spawn_transform.location.z = spawn_transform.location.z + 0.5
+        print("Spawn location:", spawn_transform.location)
+        print("Spawn rotation:", spawn_transform.rotation)
+        blueprint = self.blueprint_library.filter(blueprint_name)[0]
+        blueprint.set_attribute("role_name", role_name)
+        vehicle = self.world.spawn_actor(blueprint, spawn_transform)
+
+        if IMU or GPS:
+            with initialize(version_base='1.1', config_path="configs", job_name="carla-manager"):
+                cfg = compose(config_name="config")
+
+        if IMU:
+            imu_bp = self.blueprint_library.find('sensor.other.imu')
+
+            # add noise to IMU if specified in the config
+            imu_bp.set_attribute('noise_accel_stddev_x', str(cfg.imu.noise_accel_stddev_x))
+            imu_bp.set_attribute('noise_gyro_stddev_z', str(cfg.imu.noise_gyro_stddev_z))
+            # add noise seed if specified in the config (for reproducibility)
+            imu_bp.set_attribute('noise_seed', str(cfg.imu.noise_seed))
+
+            imu_transform = carla.Transform(carla.Location(x=cfg.imu.location.x, y=cfg.imu.location.y, z=cfg.imu.location.z))
+            imu = self.world.spawn_actor(imu_bp, imu_transform, attach_to=vehicle)
+
+        if GPS:
+            gnss_bp = self.blueprint_library.find('sensor.other.gnss')
+
+            # add noise to GNSS if specified in the config
+            gnss_bp.set_attribute('noise_lat_stddev', str(cfg.gnss.noise_lat_stddev))
+            gnss_bp.set_attribute('noise_lon_stddev', str(cfg.gnss.noise_lon_stddev))
+            # add noise seed if specified in the config (for reproducibility)
+            gnss_bp.set_attribute('noise_seed', str(cfg.gnss.noise_seed))
+
+            gnss_transform = carla.Transform(carla.Location(x=cfg.gnss.location.x, y=cfg.gnss.location.y, z=cfg.gnss.location.z))
+            gnss = self.world.spawn_actor(gnss_bp, gnss_transform, attach_to=vehicle)
+
+        if IMU or GPS:
+            return vehicle, imu, gnss
+        else:
+            return vehicle
 
     def debug_waypoints(self, waypoints):
         # draw trace_route outputs
@@ -575,7 +635,6 @@ def run_simulation_with_casadi():
         # Basic agent for preceding vehicle
         preceding_agent = BasicAgent(preceding_vehicle_actor, target_speed=PRECEDING_SPEED)  # 5 km/h
 
-
         # Set destination
         current_location = preceding_vehicle_actor.get_location()
         # Create a sequence of waypoints for the preceding vehicle to follow
@@ -596,11 +655,17 @@ def run_simulation_with_casadi():
         if waypoints:
             preceding_agent.set_destination(waypoints[0])
 
-
         # Spawn ego vehicle behind preceding vehicle
         spawn_loc_copy = SPAWN_LOCATION.copy()
         spawn_loc_copy[0] += 20  # 20 meters behind
-        ego_vehicle_actor = carla_manager.spawn_vehicle("vehicle.tesla.model3", spawn_loc_copy)
+
+        if EKF:
+            # Spawn ego vehicle with IMU and GPS sensors
+            ego_vehicle_actor, IMU, GPS = carla_manager.spawn_vehicle_sensor(
+                "vehicle.tesla.model3", spawn_loc_copy, GPS=True, IMU=True
+            )
+        else:
+            ego_vehicle_actor = carla_manager.spawn_vehicle("vehicle.tesla.model3", spawn_loc_copy)
 
         if synchronous_mode:
             carla_manager.world.tick()
@@ -608,7 +673,18 @@ def run_simulation_with_casadi():
             time.sleep(1)
 
         # Wrap with Vehicle class
-        ego_vehicle = Vehicle(ego_vehicle_actor)
+        if EKF:
+            ego_vehicle = Vehicle(ego_vehicle_actor)
+            ego_vehicle.attach_sensors(GPS=GPS, IMU=IMU)
+            # to get initial sensor data
+            if synchronous_mode:
+                carla_manager.world.tick()
+            else:
+                time.sleep(1)
+
+            ego_vehicle.initialize_ekf(P0, Q, R)
+        else:
+            ego_vehicle = Vehicle(ego_vehicle_actor)
 
         # Save spawn transform and initialize transformation matrices
         ego_vehicle.transform_to_spawn = ego_vehicle_actor.get_transform()

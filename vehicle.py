@@ -493,6 +493,50 @@ class Vehicle:
             State vector: numpy array [x, y, psi, v, a]
         """
 
+        # run the ekf prediction and update
+        imu_data = self.imu_data_queue.get_nowait()
+        self.ekf.predict(u=imu_data, imu_prediction=True, dt=0.01)  # Predict the next state
+        self.update_ekf()
+        ekf_state_x = self.get_latest_state()
+
+        # Get the vehicle transform in world coordinates
+        vehicle_transform = self.actor.get_transform()
+
+        # Get ekf position
+        x = ekf_state_x[0]
+        y = ekf_state_x[1]
+        # traform to ego coordinates if necessary
+        x, y, _ = self.world_to_ego_coordinates((x, y, vehicle_transform.location.z), use_current_transform)
+
+        # Get orientation (psi)
+        if use_current_transform:
+            # When using current transform, psi is zero in ego coordinates
+            psi = 0.0
+        else:
+            # When using spawn transform as reference, we need to calculate relative yaw
+            # current_yaw = math.radians(vehicle_transform.rotation.yaw)
+            current_yaw = ekf_state_x[2]
+            spawn_yaw = math.radians(self.transform_to_spawn.rotation.yaw)
+            psi = (current_yaw - spawn_yaw) % (2 * math.pi)
+
+            # Normalize to [-pi, pi]
+            if psi > math.pi:
+                psi -= 2 * math.pi
+
+        # Get velocity
+        # velocity = self.actor.get_velocity()
+        # speed = math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
+        speed = ekf_state_x[3]
+
+        # Estimate acceleration from control inputs
+        control = self.actor.get_control()
+        if control.throttle > 0:
+            accel = control.throttle * 3.0  # Approximate based on throttle
+        else:
+            accel = -control.brake * 3.0    # Approximate based on brake
+
+        return np.array([x, y, psi, speed, accel])
+
 
 def throttle_brake_mapping1(a):
     if a >= 0:

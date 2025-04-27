@@ -7,6 +7,7 @@ import threading
 import logging
 import sys
 import matplotlib.pyplot as plt
+import yaml
 
 # global logger settings
 # inlcude timestamp in log messages
@@ -22,12 +23,12 @@ measurement_dim = 2  # Measurement dimension
 control_dim = 2  # Control dimension
 
 # P0 = np.array([1., 1., 1., 1.])  # Initial covariance
-P0 = np.array([1.5, 1.5, 1.5, 1.])
+P0 = np.array([0.0, 0.0, 0.1, 0.1])
 
 # Q = np.eye(state_dim) * 0.1  # Process noise covariance
-Q = np.diag([0.1, 0.1, 0.005, 0.5])  # Process noise covariance
+Q = np.diag([0.01, 0.01, 0.1, 0.05])*0.1  # Process noise covariance
 
-R = np.eye(measurement_dim) * 2  # Measurement noise covariance
+R = np.eye(measurement_dim) * (0.2**2)  # Measurement noise covariance
 # R = np.diag([1, 1])  # Measurement noise covariance
 
 SPAWN_LOCATION = [
@@ -36,9 +37,23 @@ SPAWN_LOCATION = [
     14.171306,
 ]  # for spectator camera
 
+data = {
+    'time': [],
+    'gt_position': [],  # Ground truth positions [x,y]
+    'gt_yaw': [],       # Ground truth yaw angles
+    'gps_position': [],  # GPS readings
+    'ekf_position': [],  # EKF position estimates
+    'ekf_prior': [],    # EKF prior positions
+    'ekf_yaw': [],      # EKF yaw estimates
+    'ekf_prior_yaw': [],  # EKF prior yaw
+    'ekf_covariance': [],  # Store full covariance matrices for later
+    'velocity': [],     # Velocity measurements
+    'gt_velocity': []   # Ground truth velocity measurements
+}
+
 
 # Add this function outside the main loop
-def plot_covariance_ellipse(ax, x, P, sigma=2, color='r', alpha=0.3):
+def plot_covariance_ellipse(ax, x, P, sigma=1, color='r', alpha=0.3):
     """
     Plot a covariance ellipse for a 2D state with covariance P.
 
@@ -69,7 +84,7 @@ def plot_covariance_ellipse(ax, x, P, sigma=2, color='r', alpha=0.3):
     idx = eigenvals.argsort()[::-1]
     eigenvals = eigenvals[idx]
     eigenvecs = eigenvecs[:, idx]
-
+    print('eigenvals:', eigenvals)
     # Calculate ellipse parameters
     # 95% confidence interval for 2 dimensional data
     chisquare_val = sigma**2
@@ -94,6 +109,53 @@ def plot_covariance_ellipse(ax, x, P, sigma=2, color='r', alpha=0.3):
     # Plot ellipse
     return ax.plot(ellipse_pts[:, 0], ellipse_pts[:, 1], color=color, alpha=alpha)[0]
 
+
+def get_process_noise(dt, tuning_factor=7.5):
+    """
+    Build process noise matrix based on IMU noise characteristics
+
+    Args:
+        dt: Time step (should be 0.1s to match sensor_tick)
+        imu_config: IMU noise parameters
+        tuning_factor: Multiplier to account for unmodeled dynamics
+    """
+    with open('configs/imu/imu.yaml', 'r') as f:
+        imu_config = yaml.safe_load(f)
+    # IMU noise characteristics
+    accel_std = imu_config['noise_accel_stddev_x']  # 0.1 m/s²
+    gyro_std = imu_config['noise_gyro_stddev_z']    # 0.2 rad/s
+
+    # Convert to variance and apply tuning factor
+    accel_var = (accel_std * tuning_factor)**2  # ~0.0625 (m/s²)²
+    yaw_rate_var = (gyro_std * tuning_factor)**2  # ~0.25 (rad/s)²
+
+    # Initialize Q matrix
+    Q = np.zeros((4, 4))
+
+    # Position uncertainty from acceleration (x)
+    Q[0, 0] = dt**4/4 * accel_var
+    Q[0, 3] = dt**3/2 * accel_var
+
+    # Position uncertainty from acceleration (y)
+    Q[1, 1] = dt**4/4 * accel_var
+    Q[1, 3] = dt**3/2 * accel_var
+
+    # Velocity uncertainty from acceleration
+    Q[3, 0] = dt**3/2 * accel_var
+    Q[3, 1] = dt**3/2 * accel_var
+    Q[3, 3] = dt**2 * accel_var
+
+    # Heading uncertainty from gyro
+    Q[2, 2] = dt**2 * yaw_rate_var
+
+    # Make symmetric
+    Q = (Q + Q.T) / 2
+
+    return Q
+
+
+dt = 0.1  # Match sensor_tick
+Q = get_process_noise(dt, tuning_factor=5.5)
 
 if __name__ == "__main__":
     # set up the carla manager and spawn the vehicle
@@ -132,6 +194,7 @@ if __name__ == "__main__":
     plt.legend()
 
     i = 0
+    time_stamp = 0
     initial_location = ego_vehicle.actor.get_transform().location  # to stop the simulation after 100m
     while True:
         if not plt.fignum_exists(fig.number):
@@ -163,8 +226,10 @@ if __name__ == "__main__":
         # EKF prediction and update
         # get imu data
         imu_data = ego_vehicle.imu_data_queue.get_nowait()
+        # clip IMU acceleration at 5 m/s²
+        imu_data[0] = np.clip(imu_data[0], -5, 5)  # Clip acceleration in x direction
         # ego_vehicle.ekf.predict(u=u)
-        ego_vehicle.ekf.predict(u=imu_data, imu_prediction=True, dt=0.01)  # Predict the next state
+        ego_vehicle.ekf.predict(u=imu_data, imu_prediction=True, dt=0.1)  # Predict the next state
         ego_vehicle.update_ekf()
 
         ekf_state_x = ego_vehicle.get_latest_state()
@@ -178,11 +243,11 @@ if __name__ == "__main__":
                 ax1,
                 ekf_state_x[:2],  # Just the position part [x,y]
                 ego_vehicle.ekf.P_post,  # Full covariance matrix
-                sigma=2,  # 2-sigma (95% confidence)
+                sigma=1,  # 2-sigma (95% confidence)
                 color='r',
-                alpha=0.1  # Make it transparent
+                alpha=0.2  # Make it transparent
             )
-        # ax1.scatter(ego_vehicle.ekf.x_prior[0], ego_vehicle.ekf.x_prior[1], color='y', marker='o', label='EKF Prior')  # Plot EKF prior position
+        ax1.scatter(ego_vehicle.ekf.x_prior[0], ego_vehicle.ekf.x_prior[1], color='y', marker='x', label='EKF Prior')  # Plot EKF prior position
         ax1.scatter(ego_vehicle.actor.get_transform().location.x,
                     ego_vehicle.actor.get_transform().location.y,
                     color='b', label='Actual Position')
@@ -203,14 +268,33 @@ if __name__ == "__main__":
         spectator_location.location.x += 5
         carla_manager.spectator.set_transform(spectator_location)  # Keep the spectator camera in the same location
 
+        time_stamp = i * 0.1  # Assuming 10Hz simulation
+        data['time'].append(time_stamp)
+        data['gt_position'].append([ego_vehicle.actor.get_transform().location.x,
+                                    ego_vehicle.actor.get_transform().location.y])
+        data['gt_yaw'].append(np.deg2rad(ego_vehicle.actor.get_transform().rotation.yaw))
+        data['gps_position'].append([ego_vehicle.carla_coords[0], ego_vehicle.carla_coords[1]])
+        data['ekf_position'].append([ekf_state_x[0], ekf_state_x[1]])
+        data['ekf_prior'].append([ego_vehicle.ekf.x_prior[0], ego_vehicle.ekf.x_prior[1]])
+        data['ekf_yaw'].append(ego_vehicle.ekf.x[2])
+        data['ekf_prior_yaw'].append(ego_vehicle.ekf.x_prior[2])
+        data['ekf_covariance'].append(ego_vehicle.ekf.P_post.copy())
+        data['velocity'].append(ego_vehicle.ekf.x[3])
+        velocity = ego_vehicle.actor.get_velocity()
+        speed = np.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
+        data['gt_velocity'].append(speed)
         # update the world
         carla_manager.world.tick()
         plt.pause(.1)
-        print('Ground Truth:', ego_vehicle.actor.get_transform().location)
-        print('GT yaw:', ego_vehicle.actor.get_transform().rotation.yaw, np.deg2rad(ego_vehicle.actor.get_transform().rotation.yaw))
+        # print('Ground Truth:', ego_vehicle.actor.get_transform().location)
+        # print('GT yaw:', ego_vehicle.actor.get_transform().rotation.yaw, np.deg2rad(ego_vehicle.actor.get_transform().rotation.yaw))
+        print('imu acceleration:', imu_data[0])
         print('vehicle velocity:', ego_vehicle.actor.get_velocity())
-        if ego_vehicle.actor.get_transform().location.distance(initial_location) > 100:
+        print('EKF state:', ekf_state_x)
+        if ego_vehicle.actor.get_transform().location.distance(initial_location) > 150:
             break
     plt.ioff()
     plt.show(block=True)  # Show the plot and block until closed
+    np.savez('ekf_data.npz', **data)
+    print('Data saved to ekf_data.npz')
     carla_manager.__del__()  # Clean up the Carla manager and close the simulation
