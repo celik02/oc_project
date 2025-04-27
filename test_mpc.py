@@ -5,6 +5,7 @@ import carla
 from agents.navigation.global_route_planner import GlobalRoutePlanner  # type: ignore
 from agents.navigation.basic_agent import BasicAgent
 from vehicle import Vehicle  # Import the Vehicle class
+from pid import get_next_waypoint_from_list
 import traceback
 import casadi as ca
 import logging
@@ -92,8 +93,8 @@ class BicycleMPCController:
         self.min_steer = -np.pi / 4  # Min steering allowed (rad)
 
         # Cost function weights
-        self.w_path = 50.0      # Path following reward
-        self.w_speed = 10.0     # Target speed reward
+        self.w_path = 30.0      # Path following reward
+        self.w_speed = 0.0     # Target speed reward
         self.w_accel = 1.0      # Acceleration minimization
         self.w_steer = 1.0      # Steering minimization
         self.w_jerk = 5.0       # Jerk minimization (change in acceleration)
@@ -115,6 +116,17 @@ class BicycleMPCController:
         Returns:
             carla.VehicleControl object
         """
+        # clear all drawned objects in CARLA
+        if self.carla_manager:
+            self.carla_manager.world.debug.draw_string(
+                carla.Location(x=0, y=0, z=0),
+                "",
+                draw_shadow=False,
+                color=carla.Color(r=0, g=0, b=0),
+                life_time=120.0,
+                persistent_lines=True,
+            )
+
         # Get ego vehicle state
         if not EKF:
             x0 = ego_vehicle.get_vehicle_state()
@@ -130,8 +142,32 @@ class BicycleMPCController:
         preceding_vehicle_pred = self.predict_vehicle_trajectory(
             preceding_pos_in_ego, PRECEDING_SPEED)
 
-        # Create reference path (straight ahead in ego coordinates)
+
+        # Generate reference path in ego coordinates
         reference_path = self.generate_reference_path(x0[0])
+
+        # Visualize reference path in CARLA but after reverting it back to the # world coordinates
+        if self.carla_manager:
+            # Convert reference path to world coordinates while padding the z co-ordinates with zero
+            reference_path_world = [
+                ego_vehicle.ego_to_world_coordinates((point[0], point[1], 0.0))
+                for point in reference_path
+            ]
+            # Draw the reference path in CARLA
+            # convert to carla location objects
+            reference_path_world = [
+                carla.Location(x=point[0], y=point[1], z=point[2])
+                for point in reference_path_world
+            ]
+            for point in reference_path_world:
+                self.carla_manager.world.debug.draw_string(
+                    point,
+                    "O",
+                    draw_shadow=False,
+                    color=carla.Color(r=0, g=255, b=0),
+                    life_time=120.0,
+                    persistent_lines=True,
+                )
 
         # Initialize or update CasADi solver
         if not self.casadi_setup_done:
@@ -145,7 +181,7 @@ class BicycleMPCController:
         # Convert to CARLA control
         control = self.convert_to_control(u_optimal[0])
 
-        return control
+        return control, u_optimal
 
     def predict_vehicle_trajectory(self, position, speed, heading=0.0):
         """
@@ -173,7 +209,7 @@ class BicycleMPCController:
         for i in range(self.horizon):
             # Points spaced at 1m intervals directly ahead
             x = (i + 1) * 1.0 + x_start  # 1m ahead for each step
-            y = 0.0  # Center of lane
+            y = 0.0 - i*0.1  # Center of lane
             path.append((x, y))
 
         return path
@@ -245,18 +281,24 @@ class BicycleMPCController:
 
             # Collision avoidance with preceding vehicle
             # Define ellipsoid safety zone
-            a = 6.0  # Longitudinal semi-axis
-            b = 3.0  # Lateral semi-axis
+            a = 7.0  # Longitudinal semi-axis
+            b = 3.5  # Lateral semi-axis
 
-            # Distance to preceding vehicle at step k
+            # Original ellipsoidal distance calculation
             dx = xk[0] - preceding_x[k]
             dy = xk[1] - preceding_y[k]
+            ellipsoid_distance = (dx/a)**2 + (dy/b)**2
 
-            # Ellipsoidal safety constraint: (dx/a)² + (dy/b)² >= 1
-            safety_constraint = (dx/a)**2 + (dy/b)**2
+            # When ego is behind: constraint is "ellipsoid_distance >= 1.0"
+            # When ego is ahead by 3.0: constraint is "0 >= 0" (automatically satisfied)
+            safety_constraint = ca.if_else(dx < 1.0,
+                                        ellipsoid_distance - 1.0,  # When behind: must stay outside ellipsoid
+                                        0.0)                       # When ahead: constraint inactive (0 >= 0)
+
             g.append(safety_constraint)
-            lbg.append(1.0)  # Must be outside ellipsoid
+            lbg.append(0.0)  # Constraint must be >= 0
             ubg.append(ca.inf)
+
 
             # State propagation
             xk_next = dynamics_func(xk, uk)
@@ -269,7 +311,7 @@ class BicycleMPCController:
 
                 # State bounds
                 opt_vars_lb.extend([-ca.inf, -ca.inf, -ca.inf, 0, self.min_accel])  # v >= 0, a >= -5
-                opt_vars_ub.extend([ca.inf, ca.inf, ca.inf, 40, 5.0])     #self.max_accel<= 40, a <= 5
+                opt_vars_ub.extend([ca.inf, ca.inf, ca.inf, 40, self.max_accel])     #self.max_accel<= 40, a <= 5
 
                 # Dynamics constraints (next state follows dynamics model)
                 g.append(xk_next_var - xk_next)
@@ -292,14 +334,14 @@ class BicycleMPCController:
 
         # Solver options
         opts = {
-            'ipopt': {
-                'print_level': 0,
-                'max_iter': 500,
-                'acceptable_tol': 1e-4,
-                'warm_start_init_point': 'yes',
-            },
-            'print_time': False
-        }
+                'ipopt': {
+                    'print_level': 0,                # Minimal output
+                    'max_iter': 500,                 # Reduced from 500 for speed
+                    'acceptable_tol': 1e-4,          # Slightly relaxed tolerance
+                    'warm_start_init_point': 'yes',
+                },
+                'print_time': False
+            }
 
         # Store constraint bounds
         self.lbg = lbg
@@ -377,7 +419,7 @@ class BicycleMPCController:
                 print(f"Warning: Solver status: {stats['return_status']}")
                 # Return zero steering and negative acceleration as fallback
                 control = np.zeros((self.horizon, self.num_controls))
-                control[:, 0] = self.min_accel / 100  # Negative acceleration
+                # control[:, 0] = self.min_accel / 100  # Negative acceleration
                 return control
             else:
                 print(f"Solver succeeded: {stats['return_status']}")
@@ -633,7 +675,7 @@ def run_simulation_with_casadi():
         preceding_vehicle = Vehicle(preceding_vehicle_actor)
 
         # Basic agent for preceding vehicle
-        preceding_agent = BasicAgent(preceding_vehicle_actor, target_speed=PRECEDING_SPEED)  # 5 km/h
+        preceding_agent = BasicAgent(preceding_vehicle_actor, target_speed=PRECEDING_SPEED)
 
         # Set destination
         current_location = preceding_vehicle_actor.get_location()
@@ -744,17 +786,81 @@ def run_simulation_with_casadi():
                 preceding_vehicle_actor.apply_control(control_cmd)
 
                 # Get MPC control for ego vehicle
-                ego_control = mpc_controller.run_step(
+                ego_control, u_optimal = mpc_controller.run_step(
                     ego_vehicle, preceding_vehicle, target_speed
                 )
 
                 # Apply control to ego vehicle
                 ego_vehicle_actor.apply_control(ego_control)
 
+                # Save the state and control input as a csv file for plotting later
+                # Initialize data collection if first iteration
+                if not hasattr(run_simulation_with_casadi, 'simulation_data'):
+                    run_simulation_with_casadi.simulation_data = []
+                    run_simulation_with_casadi.sim_time = 0.0
+                    import os
+                    os.makedirs('results', exist_ok=True)
+                    print("Data collection initialized in ego coordinate frame")
+
+                # Update simulation time
+                run_simulation_with_casadi.sim_time += dt
+
+                # Get ego vehicle state in ego coordinates [x, y, psi, v, a]
+                ego_state = ego_vehicle.get_vehicle_state()
+
+                # Get preceding vehicle position in ego coordinates
+                preceding_location = preceding_vehicle.actor.get_location()
+                preceding_pos_in_ego = ego_vehicle.world_to_ego_coordinates(preceding_location)
+
+                # Extract MPC control commands
+                # The raw output from the MPC solver contains acceleration and steering commands
+                mpc_accel_cmd = u_optimal[0][0] if len(u_optimal) > 0 else 0
+                mpc_steer_cmd = u_optimal[0][1] if len(u_optimal) > 0 else 0
+
+                # Create data record in ego coordinate frame
+                data_point = {
+                    'time': run_simulation_with_casadi.sim_time,
+                    'ego_x': ego_state[0],  # x-position in ego frame
+                    'ego_y': ego_state[1],  # y-position in ego frame
+                    'ego_heading': ego_state[2],  # heading in ego frame
+                    'ego_speed': ego_state[3],  # speed
+                    'ego_accel': ego_state[4],  # acceleration
+                    'preceding_x': preceding_pos_in_ego[0],  # x-position in ego frame
+                    'preceding_y': preceding_pos_in_ego[1],  # y-position in ego frame
+                    'control_throttle': ego_control.throttle,
+                    'control_brake': ego_control.brake,
+                    'control_steer': ego_control.steer,
+                    'mpc_accel_cmd': mpc_accel_cmd,
+                    'mpc_steer_cmd': mpc_steer_cmd
+                }
+
+                # Append to data collection
+                run_simulation_with_casadi.simulation_data.append(data_point)
+
+                # Check if target position reached (100m in ego x-direction)
+                if ego_state[0] >= 100.0:
+                    print(f"Target position reached at {ego_state[0]:.2f}m in ego frame. Ending simulation.")
+
+                    # Save data to CSV
+                    import csv
+                    from datetime import datetime
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    csv_filename = f'results/overtaking_simulation_{timestamp}.csv'
+
+                    with open(csv_filename, 'w', newline='') as csvfile:
+                        writer = csv.DictWriter(csvfile, fieldnames=data_point.keys())
+                        writer.writeheader()
+                        for data_row in run_simulation_with_casadi.simulation_data:
+                            writer.writerow(data_row)
+
+                    print(f"Data saved to {csv_filename}")
+                    break
+
                 # Advance simulation
                 carla_manager.world.tick()
 
         except KeyboardInterrupt:
+            carla_manager.__del__()
             print("\nSimulation terminated by user")
 
     except Exception as e:
@@ -762,7 +868,7 @@ def run_simulation_with_casadi():
         traceback.print_exc()
 
     finally:
-        # Clean up
+        # Clean up actors
         if preceding_vehicle_actor and preceding_vehicle_actor.is_alive:
             preceding_vehicle_actor.destroy()
 
@@ -773,6 +879,24 @@ def run_simulation_with_casadi():
             settings = carla_manager.world.get_settings()
             settings.synchronous_mode = False
             carla_manager.world.apply_settings(settings)
+
+        # Save collected data to CSV if simulation was interrupted
+        if hasattr(run_simulation_with_casadi, 'simulation_data') and run_simulation_with_casadi.simulation_data:
+            import csv
+            import os
+            from datetime import datetime
+
+            os.makedirs('results', exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            csv_filename = f'results/overtaking_simulation_{timestamp}.csv'
+
+            with open(csv_filename, 'w', newline='') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=run_simulation_with_casadi.simulation_data[0].keys())
+                writer.writeheader()
+                for data_row in run_simulation_with_casadi.simulation_data:
+                    writer.writerow(data_row)
+
+            print(f"Simulation data saved to {csv_filename}")
 
 
 if __name__ == "__main__":
