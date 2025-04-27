@@ -8,8 +8,19 @@ import argparse
 from scipy.signal import savgol_filter
 import re
 
+# Set global font sizes for all plots - INCREASED FONT SIZES
+plt.rcParams.update({
+    'font.size': 32,             # Base font size (increased from 24)
+    'axes.titlesize': 32,        # Title font size (increased from 24)
+    'axes.labelsize': 32,        # Axis label font size (increased from 24)
+    'xtick.labelsize': 32,       # X-tick label font size (increased from 24)
+    'ytick.labelsize': 32,       # Y-tick label font size (increased from 24)
+    'legend.fontsize': 24,       # Legend font size (increased from 18)
+    'figure.titlesize': 32       # Figure title font size (increased from 24)
+})
+
 # Constants for electric vehicle power model
-VEHICLE_MASS = 1600  # kg (Tesla Model 3 approximate mass)
+VEHICLE_MASS = 2000  # kg (Tesla Model 3 approximate mass)
 AIR_DENSITY = 1.2256  # kg/m^3
 FRONTAL_AREA = 2.22  # m^2
 DRAG_COEFFICIENT = 0.28
@@ -148,8 +159,8 @@ def extract_algorithm_name(filename):
     """Extract algorithm name from filename."""
     # Try to extract algorithm name using regex patterns
     patterns = [
-        r'overtaking_simulation_\d+_(\w+)\.csv',  # Format: overtaking_simulation_20250423_MPC.csv
-        r'(\w+)_overtaking_\d+\.csv',             # Format: MPC_overtaking_20250423.csv
+        r'overtaking_simulation_\d+_(\w+)\.csv',  # Format: overtaking_simulation_24250423_MPC.csv
+        r'(\w+)_overtaking_\d+\.csv',             # Format: MPC_overtaking_24250423.csv
         r'(\w+)_simulation\.csv'                  # Format: MPC_simulation.csv
     ]
     
@@ -164,7 +175,7 @@ def extract_algorithm_name(filename):
 
 def plot_trajectories(metrics_dict, output_dir):
     """Plot vehicle trajectories with reference path extrapolated correctly to longitude 100."""
-    plt.figure(figsize=(10, 6))
+    plt.figure(figsize=(14, 10))  # Increased figure size for better readability
     
     # Check if metrics dictionary is empty
     if not metrics_dict:
@@ -224,95 +235,131 @@ def plot_trajectories(metrics_dict, output_dir):
         extrap_y = np.concatenate([observed_y, extrapolated_y])
         
         # Plot the improved reference path
-        plt.plot(extrap_x, extrap_y, 'k--', linewidth=2, 
-                label='Extrapolated Reference Path')
+        plt.plot(extrap_x, extrap_y, 'k--', linewidth=3, 
+                label='Extrapolated Ref')
     
     # Plot actual trajectories for all algorithms
     for algo, metrics in metrics_dict.items():
-        plt.plot(metrics['ego_x'], metrics['ego_y'], label=f'{algo} - Ego Vehicle')
-        plt.scatter(metrics['preceding_x'], metrics['preceding_y'], 
-                   marker='x', alpha=0.5, label=f'{algo} - Preceding Vehicle')
+        plt.plot(metrics['ego_x'], metrics['ego_y'], linewidth=3, label=f'{algo} - Ego')
+        plt.scatter(metrics['preceding_x'], metrics['preceding_y'], s=50,
+                   marker='x', alpha=0.6, label=f'{algo} - Preceding')
     
-    plt.xlabel('Longitudinal Position (m)')
-    plt.ylabel('Lateral Position (m)')
-    plt.title('Vehicle Trajectories with Extended Reference Path')
+    plt.xlabel('Longitudinal Position (m)', fontsize=32)
+    plt.ylabel('Lateral Position (m)', fontsize=32)
+    # Title removed as requested
     plt.grid(True)
-    plt.legend()
-    plt.savefig(os.path.join(output_dir, 'trajectories.png'), dpi=300, bbox_inches='tight')
+    
+    # Modified: Set legend to bottom left
+    plt.legend(fontsize=24, framealpha=0.7, loc='lower right')
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'trajectories.svg'), dpi=300, bbox_inches='tight')
     plt.close()
 
     
 def plot_speed_profiles(metrics_dict, output_dir):
     """Plot speed profiles for all algorithms."""
-    plt.figure(figsize=(10, 6))
+    plt.figure(figsize=(14, 10))  # Increased figure size
     
     for algo, metrics in metrics_dict.items():
-        plt.plot(metrics['time'], metrics['ego_speed'], label=f'{algo}')
+        plt.plot(metrics['time'], metrics['ego_speed'], linewidth=3, label=f'{algo}')
     
     # Plot target speed
     target_speed = 25 / 3.6  # 25 km/h converted to m/s
-    plt.axhline(y=target_speed, color='k', linestyle='--', label='Target Speed')
+    plt.axhline(y=target_speed, color='k', linestyle='--', linewidth=2.5, label='Target Speed')
     
-    plt.xlabel('Time (s)')
-    plt.ylabel('Speed (m/s)')
-    plt.title('Ego Vehicle Speed Profiles')
+    plt.xlabel('Time (s)', fontsize=32)
+    plt.ylabel('Speed (m/s)', fontsize=32)
+    # Title removed as requested
     plt.grid(True)
-    plt.legend()
-    plt.savefig(os.path.join(output_dir, 'speed_profiles.png'), dpi=300, bbox_inches='tight')
+    
+    # Modified: Set legend to bottom left
+    plt.legend(fontsize=24, framealpha=0.7, loc='lower right')
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'speed_profiles.svg'), dpi=300, bbox_inches='tight')
     plt.close()
 
 def plot_comfort_metrics(metrics_dict, output_dir):
     """Plot comfort metrics (jerk and steering rate) for all algorithms."""
-    fig = plt.figure(figsize=(15, 10))
+    # RESTORE ORIGINAL FONT SIZES FOR THIS PLOT ONLY
+    original_font_sizes = {
+        'font.size': 24,
+        'axes.titlesize': 24,
+        'axes.labelsize': 24,
+        'xtick.labelsize': 24,
+        'ytick.labelsize': 24,
+        'legend.fontsize': 18,
+        'figure.titlesize': 24
+    }
+    
+    # Save current font settings
+    current_font_sizes = {key: plt.rcParams[key] for key in original_font_sizes}
+    
+    # Apply original font sizes for this plot
+    plt.rcParams.update(original_font_sizes)
+    
+    fig = plt.figure(figsize=(18, 12))  # Increased figure size
     gs = GridSpec(2, 2, figure=fig)
+    
+    # Create a list to store all line objects and their labels
+    all_lines = []
+    all_labels = []
     
     # Plot acceleration
     ax1 = fig.add_subplot(gs[0, 0])
     for algo, metrics in metrics_dict.items():
-        ax1.plot(metrics['time'], metrics['ego_accel'], label=f'{algo}')
-    ax1.set_xlabel('Time (s)')
-    ax1.set_ylabel('Acceleration (m/s²)')
-    ax1.set_title('Acceleration Profiles')
+        line, = ax1.plot(metrics['time'], metrics['ego_accel'], linewidth=3, label=f'{algo}')
+        all_lines.append(line)
+        all_labels.append(f'{algo}')
+    ax1.set_xlabel('Time (s)', fontsize=24)
+    ax1.set_ylabel('Acceleration (m/s²)', fontsize=24)
+    # Title removed as requested
     ax1.grid(True)
-    ax1.legend()
+    # Legend removed from this subplot
     
     # Plot jerk
     ax2 = fig.add_subplot(gs[0, 1])
     for algo, metrics in metrics_dict.items():
         # Smooth jerk data which can be noisy
         smoothed_jerk = smooth_data(metrics['jerk'])
-        ax2.plot(metrics['time'], smoothed_jerk, label=f'{algo}')
-    ax2.set_xlabel('Time (s)')
-    ax2.set_ylabel('Jerk (m/s³)')
-    ax2.set_title('Jerk Profiles')
+        ax2.plot(metrics['time'], smoothed_jerk, linewidth=3)
+    ax2.set_xlabel('Time (s)', fontsize=24)
+    ax2.set_ylabel('Jerk (m/s³)', fontsize=24)
+    # Title removed as requested
     ax2.grid(True)
-    ax2.legend()
+    # Legend removed from this subplot
     
     # Plot steering angle
     ax3 = fig.add_subplot(gs[1, 0])
     for algo, metrics in metrics_dict.items():
-        ax3.plot(metrics['time'], metrics['control_steer'], label=f'{algo}')
-    ax3.set_xlabel('Time (s)')
-    ax3.set_ylabel('Steering Angle')
-    ax3.set_title('Steering Profiles')
+        ax3.plot(metrics['time'], metrics['control_steer'], linewidth=3)
+    ax3.set_xlabel('Time (s)', fontsize=24)
+    ax3.set_ylabel('Steering Angle', fontsize=24)
+    # Title removed as requested
     ax3.grid(True)
-    ax3.legend()
+    # Legend removed from this subplot
     
     # Plot steering rate
     ax4 = fig.add_subplot(gs[1, 1])
     for algo, metrics in metrics_dict.items():
         # Smooth steering rate data
         smoothed_steering_rate = smooth_data(metrics['steering_rate'])
-        ax4.plot(metrics['time'], smoothed_steering_rate, label=f'{algo}')
-    ax4.set_xlabel('Time (s)')
-    ax4.set_ylabel('Steering Rate (1/s)')
-    ax4.set_title('Steering Rate Profiles')
+        ax4.plot(metrics['time'], smoothed_steering_rate, linewidth=3)
+    ax4.set_xlabel('Time (s)', fontsize=24)
+    ax4.set_ylabel('Steering Rate (1/s)', fontsize=24)
+    # Title removed as requested
     ax4.grid(True)
-    ax4.legend()
+    
+    # Add a single legend to the bottom left subplot (ax3)
+    ax4.legend(all_lines, all_labels, fontsize=18, framealpha=0.7, loc='lower right')
     
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'comfort_metrics.png'), dpi=300, bbox_inches='tight')
+    plt.savefig(os.path.join(output_dir, 'comfort_metrics.svg'), dpi=300, bbox_inches='tight')
     plt.close()
+    
+    # Restore the current (increased) font settings after this plot
+    plt.rcParams.update(current_font_sizes)
 
 def plot_lateral_deviation(metrics_dict, output_dir):
     """
@@ -323,7 +370,7 @@ def plot_lateral_deviation(metrics_dict, output_dir):
     2. The lateral position of the ego vehicle(s) over time
     """
     # Create a figure with appropriate dimensions
-    plt.figure(figsize=(10, 6))
+    plt.figure(figsize=(14, 10))  # Increased figure size
     
     # Defensive programming: Check for empty data
     if not metrics_dict:
@@ -334,51 +381,65 @@ def plot_lateral_deviation(metrics_dict, output_dir):
     for algo, metrics in metrics_dict.items():
         if 'target_waypoint_y' in metrics and 'time' in metrics:
             plt.scatter(metrics['time'], metrics['target_waypoint_y'], 
-                       marker='o', s=30, alpha=0.5,
+                       marker='o', s=60, alpha=0.6,  # Increased marker size
                        label=f'{algo} - Target Waypoints')
         else:
             print(f"Warning: Target waypoint data not found for {algo}")
         
     # Plot ego vehicle lateral positions for each control algorithm
     for algo, metrics in metrics_dict.items():
-        plt.plot(metrics['time'], metrics['ego_y'], label=f'{algo} - Ego Path')
+        plt.plot(metrics['time'], metrics['ego_y'], linewidth=3, label=f'{algo} - Ego Path')
         
     # Finalize plot with proper formatting and annotations
-    plt.xlabel('Time (s)')
-    plt.ylabel('Lateral Position (m)')
-    plt.title('Lateral Deviation with Target Waypoints')
+    plt.xlabel('Time (s)', fontsize=32)
+    plt.ylabel('Lateral Position (m)', fontsize=32)
+    # Title removed as requested
     plt.grid(True)
-    plt.legend()
-    plt.savefig(os.path.join(output_dir, 'lateral_deviation.png'), dpi=300, bbox_inches='tight')
+    
+    # Modified: Set legend to bottom left
+    plt.legend(fontsize=24, framealpha=0.7, loc='lower right')
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'lateral_deviation.svg'), dpi=300, bbox_inches='tight')
     plt.close()
 
 def plot_power_consumption(metrics_dict, output_dir):
     """Plot power and cumulative energy consumption for all algorithms."""
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 10), sharex=True)
+    # MODIFIED: Changed from 2 rows, 1 column to 1 row, 2 columns
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(25, 10), sharex=False)  # New side-by-side layout
+    
+    # Create a list to store all line objects and their labels
+    all_lines = []
+    all_labels = []
     
     # Plot instantaneous power
     for algo, metrics in metrics_dict.items():
         # Smooth power data
         smoothed_power = smooth_data(metrics['power'])
-        ax1.plot(metrics['time'], smoothed_power / 1000, label=f'{algo}')  # Convert to kW
+        line, = ax1.plot(metrics['time'], smoothed_power / 1000, linewidth=3, label=f'{algo}')  # Convert to kW
+        all_lines.append(line)
+        all_labels.append(f'{algo}')
     
-    ax1.set_ylabel('Power (kW)')
-    ax1.set_title('Instantaneous Power Consumption')
+    ax1.set_xlabel('Time (s)', fontsize=32)  # Added x-label since no longer shared
+    ax1.set_ylabel('Power (kW)', fontsize=32)
+    # Title removed as requested
     ax1.grid(True)
-    ax1.legend()
+    # Legend removed from this subplot
     
     # Plot cumulative energy
     for algo, metrics in metrics_dict.items():
-        ax2.plot(metrics['time'], metrics['energy'], label=f'{algo}')
+        ax2.plot(metrics['time'], metrics['energy'], linewidth=3)
     
-    ax2.set_xlabel('Time (s)')
-    ax2.set_ylabel('Energy (kWh)')
-    ax2.set_title('Cumulative Energy Consumption')
+    ax2.set_xlabel('Time (s)', fontsize=32)
+    ax2.set_ylabel('Energy (kWh)', fontsize=32)
+    # Title removed as requested
     ax2.grid(True)
-    ax2.legend()
+    
+    # Add a single legend to the bottom right of the second subplot (ax2)
+    ax2.legend(all_lines, all_labels, fontsize=24, framealpha=0.7, loc='lower right')
     
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'power_consumption.png'), dpi=300, bbox_inches='tight')
+    plt.savefig(os.path.join(output_dir, 'power_consumption.svg'), dpi=300, bbox_inches='tight')
     plt.close()
 
 def plot_summary_metrics(metrics_dict, output_dir):
@@ -393,53 +454,113 @@ def plot_summary_metrics(metrics_dict, output_dir):
     overtaking_time = [metrics_dict[algo]['overtaking_time'] for algo in algorithms]
     
     # Create figure with subplots
-    fig = plt.figure(figsize=(15, 10))
+    fig = plt.figure(figsize=(20, 15))  # Increased figure size
     gs = GridSpec(2, 3, figure=fig)
+    
+    # Create a color palette for bars
+    colors = plt.cm.tab10(np.linspace(0, 1, len(algorithms)))
     
     # RMS Speed Error
     ax1 = fig.add_subplot(gs[0, 0])
-    ax1.bar(algorithms, rms_speed_error)
-    ax1.set_ylabel('RMS Error (m/s)')
-    ax1.set_title('Speed Tracking Error')
+    bars1 = ax1.bar(algorithms, rms_speed_error, color=colors)
+    ax1.set_ylabel('RMS Error (m/s)', fontsize=32)
+    # Title removed as requested
     ax1.grid(axis='y')
+    # Add value labels on top of bars
+    for bar in bars1:
+        height = bar.get_height()
+        ax1.annotate(f'{height:.3f}',
+                    xy=(bar.get_x() + bar.get_width() / 2, height),
+                    xytext=(0, 3),  # 3 points vertical offset
+                    textcoords="offset points",
+                    ha='center', va='bottom', fontsize=24)
     
     # RMS Jerk
     ax2 = fig.add_subplot(gs[0, 1])
-    ax2.bar(algorithms, rms_jerk)
-    ax2.set_ylabel('RMS Jerk (m/s³)')
-    ax2.set_title('Passenger Comfort - Acceleration')
+    bars2 = ax2.bar(algorithms, rms_jerk, color=colors)
+    ax2.set_ylabel('RMS Jerk (m/s³)', fontsize=32)
+    # Title removed as requested
     ax2.grid(axis='y')
+    # Add value labels
+    for bar in bars2:
+        height = bar.get_height()
+        ax2.annotate(f'{height:.3f}',
+                    xy=(bar.get_x() + bar.get_width() / 2, height),
+                    xytext=(0, 3),
+                    textcoords="offset points",
+                    ha='center', va='bottom', fontsize=24)
     
     # RMS Steering Rate
     ax3 = fig.add_subplot(gs[0, 2])
-    ax3.bar(algorithms, rms_steering_rate)
-    ax3.set_ylabel('RMS Steering Rate (1/s)')
-    ax3.set_title('Passenger Comfort - Steering')
+    bars3 = ax3.bar(algorithms, rms_steering_rate, color=colors)
+    ax3.set_ylabel('RMS Steering Rate (1/s)', fontsize=32)
+    # Title removed as requested
     ax3.grid(axis='y')
+    # Add value labels
+    for bar in bars3:
+        height = bar.get_height()
+        ax3.annotate(f'{height:.3f}',
+                    xy=(bar.get_x() + bar.get_width() / 2, height),
+                    xytext=(0, 3),
+                    textcoords="offset points",
+                    ha='center', va='bottom', fontsize=24)
     
     # RMS Lateral Deviation
     ax4 = fig.add_subplot(gs[1, 0])
-    ax4.bar(algorithms, rms_lateral_deviation)
-    ax4.set_ylabel('RMS Deviation (m)')
-    ax4.set_title('Path Following Accuracy')
+    bars4 = ax4.bar(algorithms, rms_lateral_deviation, color=colors)
+    ax4.set_ylabel('RMS Deviation (m)', fontsize=32)
+    # Title removed as requested
     ax4.grid(axis='y')
+    # Add value labels
+    for bar in bars4:
+        height = bar.get_height()
+        ax4.annotate(f'{height:.3f}',
+                    xy=(bar.get_x() + bar.get_width() / 2, height),
+                    xytext=(0, 3),
+                    textcoords="offset points",
+                    ha='center', va='bottom', fontsize=24)
     
     # Total Energy
     ax5 = fig.add_subplot(gs[1, 1])
-    ax5.bar(algorithms, total_energy)
-    ax5.set_ylabel('Energy (kWh)')
-    ax5.set_title('Total Energy Consumption')
+    bars5 = ax5.bar(algorithms, total_energy, color=colors)
+    ax5.set_ylabel('Energy (kWh)', fontsize=32)
+    # Title removed as requested
     ax5.grid(axis='y')
+    # Add value labels
+    for bar in bars5:
+        height = bar.get_height()
+        ax5.annotate(f'{height:.4f}',
+                    xy=(bar.get_x() + bar.get_width() / 2, height),
+                    xytext=(0, 3),
+                    textcoords="offset points",
+                    ha='center', va='bottom', fontsize=24)
     
     # Overtaking Time
     ax6 = fig.add_subplot(gs[1, 2])
-    ax6.bar(algorithms, overtaking_time)
-    ax6.set_ylabel('Time (s)')
-    ax6.set_title('Time to Complete Overtaking')
+    bars6 = ax6.bar(algorithms, overtaking_time, color=colors)
+    ax6.set_ylabel('Time (s)', fontsize=32)
+    # Title removed as requested
     ax6.grid(axis='y')
+    # Add value labels
+    for bar in bars6:
+        height = bar.get_height()
+        ax6.annotate(f'{height:.2f}',
+                    xy=(bar.get_x() + bar.get_width() / 2, height),
+                    xytext=(0, 3),
+                    textcoords="offset points",
+                    ha='center', va='bottom', fontsize=24)
+    
+    # Set legends to bottom left for each subplot
+    # For this plot type, we keep separate legends since each subplot shows different data
+    ax1.legend(fontsize=24, framealpha=0.7, loc='lower right')
+    ax2.legend(fontsize=24, framealpha=0.7, loc='lower right')
+    ax3.legend(fontsize=24, framealpha=0.7, loc='lower right')
+    ax4.legend(fontsize=24, framealpha=0.7, loc='lower right')
+    ax5.legend(fontsize=24, framealpha=0.7, loc='lower right')
+    ax6.legend(fontsize=24, framealpha=0.7, loc='lower right')
     
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'summary_metrics.png'), dpi=300, bbox_inches='tight')
+    plt.savefig(os.path.join(output_dir, 'summary_metrics.svg'), dpi=300, bbox_inches='tight')
     plt.close()
     
     # Also save metrics as a CSV file

@@ -94,7 +94,7 @@ class BicycleMPCController:
 
         # Cost function weights
         self.w_path = 30.0      # Path following reward
-        self.w_speed = 0.0     # Target speed reward
+        self.w_speed = 20.0     # Target speed reward
         self.w_accel = 1.0      # Acceleration minimization
         self.w_steer = 1.0      # Steering minimization
         self.w_jerk = 5.0       # Jerk minimization (change in acceleration)
